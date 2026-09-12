@@ -1,0 +1,178 @@
+18 June 2026
+Audits IFC models for Geolocation, duplicate elements, out of bounds objects
+Make sure you have Python 3 installed:
+	winget install Python.Python.3
+		py --version
+			Python 3.14.6
+Add Python to Windows Path
+	Search for "Edit the system environment variables"
+	System Properties > Environment Variables > System Variables > "Path"
+	Add the path to your Pyhton installation: C:\Users\YourName\AppData\Local\Programs\Python\Python314(folder)
+Instructions
+	1. Both the Python ifc_audit.py and the IFC models must be in the same folder
+	2. Open Windows Powershell
+	3. Change the current directory to the abovementioned folder cd "your_folder"
+	4. Command "python ifc_audit.py"
+
+--------------------------------------------------------------------------
+v2 - 5 September 2026
+--------------------------------------------------------------------------
+What changed
+	Duplicate detection now uses real element geometry instead of the
+	ObjectPlacement origin. Revit exports beams and columns with the
+	placement sitting at the storey origin and the true position buried in
+	the geometry, so v1 reported every beam on a level as a duplicate
+	(440 of 637 elements in the structural model - all false).
+
+	Geolocation now reports real-world map coordinates and compares the
+	IfcMapConversion of every model in the package. That is what decides
+	whether a federated set lines up.
+
+	Length units are read from the IfcProject and applied everywhere.
+	Millimetre, metre, foot and inch models all work; nothing assumes mm.
+
+	The floating-element check was rebuilt on a robust statistic and now
+	actually fires. v1 could not see a stray element 890 m from the model.
+
+	The report leads with a verdict instead of making you read it all.
+
+How a duplicate is decided
+	1. Duplicate GlobalId          -> ERROR, the file is schema-invalid
+	2. Same IFC class AND same type/family name AND bounding boxes
+	   overlapping by 90% or more  -> DUPLICATE
+	3. Same class and type name, roughly coincident but different extent,
+	   or geometry that could not be resolved -> PROBABLE
+	4. Overlapping but a DIFFERENT class or type name -> NOT a duplicate.
+	   Reported separately as an INTERFERENCE with --clash.
+
+	Overlap on its own is never treated as a duplicate.
+
+	Pairs that repeat with a constant element-id offset are reported as ONE
+	duplicated block rather than N separate findings - that pattern means a
+	group was copied in a single action.
+
+How a floating element is decided
+	Each element's distance from the model centre is measured, in plan and
+	in elevation. Anything past median + 8 x MAD of those distances is
+	flagged. MAD (median absolute deviation) tolerates up to half the model
+	being stray, so a cluster of strays cannot stretch the limit until it
+	hides itself - which is how the v1 percentile envelope failed.
+
+	The limits used are printed above the results every run. If you already
+	know the model, give an absolute distance with --float-xy / --float-z.
+
+How georeferencing is judged
+	Each model's IfcMapConversion is classed as one of three things:
+
+	  populated    Eastings/Northings/Height are filled in - a real
+	               georeference.
+	  placeholder  all zeros. The exporter wrote the entity but never
+	               filled it in. This is an identity transform, NOT a
+	               georeference, and models agreeing on those zeros are
+	               not thereby proven aligned. Reported two ways depending
+	               on whether the model geometry already carries real-world
+	               coordinates, because the fix differs.
+	  absent       no IfcMapConversion at all.
+
+	Only populated ones are compared against each other, so a placeholder's
+	zeros cannot drag the Eastings spread to a nonsense value.
+
+	Level of georeferencing (LoGeoRef) is reported per model:
+
+	  10  postal address only
+	  20  IfcSite latitude / longitude
+	  30  IfcSite placement carries the survey offset
+	  40  model context WorldCoordinateSystem / TrueNorth
+	  50  IfcMapConversion + IfcProjectedCRS   <- the only complete one
+
+	Below level 50 the report prints a HOW TO FIX block aimed at the model
+	author, explaining why naming a CRS is not georeferencing and giving the
+	Revit steps to correct it. The same text goes on the Georeferencing tab
+	of the Excel workbook so it can be issued with the findings.
+
+	The report also compares the REAL anchor - where each model's own origin
+	lands in map coordinates - rather than only the IfcMapConversion values.
+	When the offset is carried by the IfcSite placement, comparing
+	MapConversion alone sees ten identical rows of zeros and reports a false
+	pass; comparing anchors catches a model sitting metres from the rest.
+
+	Scale is checked per model, not across models. IfcMapConversion.Scale
+	converts project units into CRS map units, so a millimetre model on a
+	metre CRS must carry 0.001 and a metre model 1.0. Both are correct, and
+	comparing them to each other would report a false mismatch on any
+	package that mixes units. Each model is checked against the value its
+	own units imply.
+
+Reading the report
+	The report answers the question first, then shows the working:
+
+	  RESULT     one line per check, worst first
+	               [!]   must fix
+	               [?]   review
+	               [ok]  passed
+	  MODELS     the full file names, each given a short label
+	  ...        the detail sections, keyed by those labels
+
+	Models are labelled by the part of the file name that differs - for
+	ISO 19650 names that lands on the discipline code (AR, ST, PI...), and
+	repeats are numbered (PI1, PI2). Full names appear once, in MODELS, so
+	the rest of the report is not 40 characters of shared prefix per line.
+
+	A condition shared by several models is stated once, naming the models,
+	instead of repeated per model.
+
+	Interferences are grouped by the pair of classes involved, so a few
+	hundred pipe-and-fitting overlaps read as a few lines.
+
+	Output is plain ASCII, so "python ifc_audit.py > report.txt" is safe.
+
+Sharing the results
+	  python ifc_audit.py --excel audit.xlsx
+
+	writes a real Excel workbook you can issue to the design team. No add-in
+	and no pip install - it is built with Python's own zip library. Every
+	sheet has a frozen header row and AutoFilter switched on.
+
+	  Summary                Result block: FIX / REVIEW / PASS per check,
+	                         colour coded, with the package name and run date
+	  Models                 one row per model - schema, units, element and
+	                         geometry counts, CRS, centres, MapConversion
+	  Georeferencing         LoGeoRef level, anchor coordinates, the offset
+	                         of each model from the package median, and the
+	                         HOW TO FIX text
+	  Duplicates             one row per finding, including reused GlobalIds
+	                         and duplicated blocks
+	  Interferences by type  overlap counts per pair of IFC classes
+	  Interference pairs     every overlapping pair, for filtering
+	  Floating               every element flagged as out of place
+
+	Sheets with nothing to report are left out. Add --clash to include the
+	two interference sheets.
+
+Options (all optional - "python ifc_audit.py" alone still works)
+	--excel audit.xlsx     write the shareable Excel workbook
+	--json report.json     also write every finding to a JSON file
+	--clash                add the interference report (off by default)
+	--clash-frac 0.30      overlap share of the smaller element to report
+	--dup-iou 0.90         box overlap at or above which a pair is DUPLICATE
+	--probable-iou 0.50    box overlap at or above which a pair is PROBABLE
+	--dup-tol 10           coincidence tolerance in millimetres
+	--geo-tol 1            MapConversion agreement tolerance in millimetres
+	--min-geometry 0.90    flag a model resolving less geometry than this
+	--float-k 8            floating sensitivity; lower is stricter
+	--float-min 10         floor for the derived float limits, metres
+	--float-xy M           override the plan float limit with M metres
+	--float-z M            override the vertical float limit with M metres
+	--max-rows 20          rows printed per section per model
+
+	Note: in v1, --float-xy was a multiplier and --float-z was a threshold
+	that was combined with one. Both are now plain absolute overrides in
+	metres, and both are off unless you pass them.
+
+Notes
+	Model names print in full; every column widens to the longest name.
+
+	INTERFERENCES is a bounding-box smell test, not clash detection. On MEP
+	models it reports pipes overlapping their own fittings at connections.
+
+	ifc_audit_v1_backup.py is the previous version, kept for comparison.
