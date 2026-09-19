@@ -185,12 +185,23 @@ How a duplicate is decided
 	1. Duplicate GlobalId          -> ERROR, the file is schema-invalid
 	2. Same IFC class AND same type/family name AND bounding boxes
 	   overlapping by 90% or more  -> DUPLICATE
-	3. Same class and type name, roughly coincident but different extent,
-	   or geometry that could not be resolved -> PROBABLE
+	3. Same class and type name, roughly coincident but different extent
+	                               -> PROBABLE
 	4. Overlapping but a DIFFERENT class or type name -> NOT a duplicate.
 	   Reported separately as an INTERFERENCE with --clash.
 
 	Overlap on its own is never treated as a duplicate.
+
+	From v3 an element whose body geometry could not be read is left OUT of
+	the duplicate check entirely. All it has is a placement origin, which is
+	a point rather than an extent, and a pair of points could never be
+	graded above PROBABLE however they were compared. The count left out is
+	printed per model under DIAGNOSTICS, because a check that did not run
+	must not read as a check that passed.
+
+	One consequence is worth knowing: the models with the weakest geometry
+	are also the least examined for duplicates. Improving a model's geometry
+	resolution restores its duplicate coverage at the same time.
 
 	Pairs that repeat with a constant element-id offset are reported as ONE
 	duplicated block rather than N separate findings - that pattern means a

@@ -1884,7 +1884,11 @@ def audit_file(path, opt):
 
     # -- duplicates ---------------------------------------------------------
     tol = opt.dup_tol / u                    # mm -> project units
-    dup_groups, _ = find_duplicates(m, elems, tol, opt.dup_iou, opt.probable_iou)
+    # only elements with a real extent: a placement origin is a point, and a
+    # pair of points could never be graded above PROBABLE anyway
+    solid = [e for e in elems if e.source == 'body']
+    n_dup_skipped = len(elems) - len(solid)
+    dup_groups, _ = find_duplicates(m, solid, tol, opt.dup_iou, opt.probable_iou)
     dup_ids = {i for g in dup_groups for i in g['ids']}
 
     dup_guid = {g: c for g, c in m.guid_count.items() if c > 1 and g}
@@ -1951,6 +1955,7 @@ def audit_file(path, opt):
         'footprint_m': footprint,
         'float_thresholds_m': float_thr,
         'n_elements': len(elems), 'n_with_body_geometry': n_body,
+        'n_dup_skipped': n_dup_skipped,
         'n_aggregate_containers': m.n_containers,
         'unhandled_geometry': dict(m.unhandled.most_common(8)),
         'dup_guid_groups': len(dup_guid),
@@ -2823,9 +2828,15 @@ def _diag_section(res, opt, lab, lw):
             lw, lab[r['file']],
             '%d/%d  (%s%%)' % (r['n_with_body_geometry'], r['n_elements'], shown),
             '; '.join(notes), flag)).rstrip())
-    if any(r['n_with_body_geometry'] < r['n_elements'] for r in res):
-        print('  Elements without body geometry fall back to their placement origin')
-        print('  and can only ever be graded PROBABLE, never DUPLICATE.')
+    skipped = [r for r in res if r.get('n_dup_skipped')]
+    if skipped:
+        print('  Elements whose body geometry could not be read have only a')
+        print('  placement origin - a point, not an extent - so they are left out')
+        print('  of the duplicate check rather than graded on a position that')
+        print('  says nothing. Not checked for duplicates:')
+        for r in skipped:
+            print('    %-8s %s' % (lab[r['file']],
+                                   plural(r['n_dup_skipped'], 'element')))
     fl_any = [r for r in res if r['float_thresholds_m']]
     if fl_any:
         print('  Floating limits are median + %g x MAD of each element centroid'
