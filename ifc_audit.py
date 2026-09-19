@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-ifc_audit.py - openBIM / IFC model-package review tool.  (v2)
+ifc_audit.py - openBIM / IFC model-package review tool.  (v3)
 
 Checks a folder (or list) of .ifc files for:
+  * Export setup: the ViewDefinition (MVD) the authoring tool declared in the
+    file header, checked against the schema actually written.  A Revit export
+    left on 'IFC 2x3 Coordination View' while the schema target is IFC4 names
+    an IFC2x3 MVD inside an IFC4 file; the receiving side then gets the
+    guarantees of neither, and nothing in the model tree shows it.
+  * Classification: whether every geometric element says what it is - an
+    IfcClass that is not a generic proxy, and a PredefinedType that is neither
+    NOTDEFINED nor pushed to USERDEFINED.  A specific PredefinedType on the
+    element's type object counts, because the occurrence inherits it.  Type
+    objects marked USERDEFINED with no ElementType are reported separately:
+    that one breaks a schema rule rather than merely being vague.
   * Geolocation: schema, units, IfcSite RefLat/Long/Elev, IfcMapConversion +
     IfcProjectedCRS, and the model position in BOTH project-local and
     real-world (map E/N/H) coordinates.
@@ -45,7 +56,7 @@ Usage:
   python ifc_audit.py <folder> --float-k 4               # stricter float check
   python ifc_audit.py <folder> --float-z 20              # absolute float limit, m
 """
-import re, sys, os, json, math, glob, argparse, datetime
+import re, sys, os, json, math, glob, argparse, datetime, time
 from collections import Counter, defaultdict
 
 # ----------------------------------------------------------------------------
@@ -165,6 +176,349 @@ def point_rows(v):
         except ValueError:
             pass
     return rows
+
+
+# ----------------------------------------------------------------------------
+# Model view definition (MVD) and element classification
+# ----------------------------------------------------------------------------
+
+RE_VIEWDEF = re.compile(r"ViewDefinition\s*\[([^\]]*)\]", re.I)
+RE_EXCHANGE = re.compile(r"ExchangeRequirement\s*\[([^\]]*)\]", re.I)
+RE_COORDREF = re.compile(r"CoordinateReference\s*\[([^\]]*)\]", re.I)
+RE_VIEW_VER = re.compile(r"^(.*?)[_\s]*V(\d[\d.]*)$", re.I)
+RE_ENUM = re.compile(r"^\.([A-Z][A-Z0-9_]*)\.$")
+
+
+def schema_family(schema):
+    """'IFC4X3_ADD2' -> 'IFC4X3'.  The addendum never changes which MVD applies."""
+    s = (schema or '?').upper().replace(' ', '')
+    for fam in ('IFC4X3', 'IFC4X2', 'IFC4X1', 'IFC4', 'IFC2X3', 'IFC2X2'):
+        if s.startswith(fam):
+            return fam
+    return s
+
+
+# Base ViewDefinition name -> (schema families it belongs to, plain-English name)
+MVD_SCHEMAS = {
+    'COORDINATIONVIEW':            (('IFC2X3',), 'Coordination View'),
+    'IFC2X3COORDINATIONVIEW':      (('IFC2X3',), 'Coordination View'),
+    'SPACEBOUNDARYADDONVIEW':      (('IFC2X3',), 'Space Boundary Add-on View'),
+    'QUANTITYTAKEOFFADDONVIEW':    (('IFC2X3',), 'Quantity Take-off Add-on View'),
+    'FMHANDOVERVIEW':              (('IFC2X3',), 'FM Handover View'),
+    'BASICFMHANDOVERVIEW':         (('IFC2X3',), 'Basic FM Handover View'),
+    'COBIE2.4DESIGNDELIVERABLE':   (('IFC2X3',), 'COBie 2.4 Design Deliverable'),
+    'STRUCTURALANALYSISVIEW':      (('IFC2X3', 'IFC4'), 'Structural Analysis View'),
+    'REFERENCEVIEW':               (('IFC4', 'IFC4X1', 'IFC4X2', 'IFC4X3'),
+                                    'Reference View'),
+    'DESIGNTRANSFERVIEW':          (('IFC4', 'IFC4X1', 'IFC4X2', 'IFC4X3'),
+                                    'Design Transfer View'),
+    'ALIGNMENTBASEDREFERENCEVIEW': (('IFC4X1', 'IFC4X3'),
+                                    'Alignment-based Reference View'),
+}
+
+# Views that restrict geometry to what a receiver only has to draw
+LIGHTWEIGHT_VIEWS = {'REFERENCEVIEW', 'ALIGNMENTBASEDREFERENCEVIEW'}
+
+# ViewDefinition strings a given exporter writes by schema rather than by the
+# view setup chosen, so they carry no information about the MVD.  Revit writes
+# 'CoordinationView' into every IFC4/IFC4x3 file and 'CoordinationView_V2.0'
+# into every IFC2x3 file, whichever Reference View or Design Transfer View
+# setup produced it.  Reporting that per model is N identical findings the
+# author cannot act on; it is a fact about the tool, not about the model.
+EXPORTER_ARTEFACTS = (
+    ('REVIT', ('IFC4', 'IFC4X1', 'IFC4X2', 'IFC4X3'), 'COORDINATIONVIEW'),
+)
+
+
+def exporter_artefact(base, fam, tool):
+    t = (tool or '').upper()
+    return any(name in t and fam in fams and base == view
+               for name, fams, view in EXPORTER_ARTEFACTS)
+
+
+def split_view(v):
+    """'ReferenceView_V1.2' -> ('REFERENCEVIEW', '1.2')."""
+    s = (v or '').strip().replace(' ', '')
+    m = RE_VIEW_VER.match(s)
+    if m:
+        return m.group(1).upper().rstrip('_'), m.group(2)
+    return s.upper(), None
+
+
+def view_status(view, schema, tool=None):
+    """Grade the header ViewDefinition, then hold it to the schema it rides on.
+
+    A correct MVD declaration on a superseded schema is still a model the rest
+    of the package has to work around, so it never returns PASS - see
+    _view_status for the MVD grading itself.
+    """
+    sev, text = _view_status(view, schema, tool)
+    if sev == PASS and schema_family(schema) in NO_MAPCONV_SCHEMAS:
+        return REVIEW, ('%s - but %s is itself superseded: no IfcMapConversion, '
+                        'no PredefinedType on many classes, and generic flow '
+                        'classes in place of real ones' % (text, schema))
+    return sev, text
+
+
+def _view_status(view, schema, tool=None):
+    """Grade the header ViewDefinition against the schema actually written.
+
+    A mismatch is worth reporting because anything that reads the header is
+    told the wrong MVD.  It is NOT evidence that the wrong export setup was
+    used: Revit's IFC4/IFC4x3 exporter has been observed writing
+    'CoordinationView' into a file whose schema and ExchangeRequirement both
+    match the IFC4x3 Reference View setup that was actually selected.  So the
+    finding names the header as the unreliable part and says what to check,
+    rather than sending the author back to re-export something they already
+    exported correctly.
+    """
+    fam = schema_family(schema)
+    if not view:
+        return REVIEW, ('no ViewDefinition in the file header - nothing states '
+                        'which MVD the export claims to follow')
+    base, ver = split_view(view)
+    known = MVD_SCHEMAS.get(base)
+    if known is None:
+        return REVIEW, 'ViewDefinition "%s" is not a recognised MVD name' % view
+    fams, nice = known
+    shown = nice + (' %s' % ver if ver else '')
+    if fam not in fams:
+        if exporter_artefact(base, fam, tool):
+            return PASS, ('Revit writes "%s" for every %s export, including '
+                          'the %s Reference View setup - the header records the '
+                          'schema, not the MVD' % (view, fam, fam))
+        return REVIEW, ('ViewDefinition "%s" is the %s MVD but the file is '
+                        'written as %s, so anything reading the header is told '
+                        'the wrong MVD; check the export setup against the '
+                        'schema target' % (view, '/'.join(fams), schema))
+    if base in LIGHTWEIGHT_VIEWS:
+        return REVIEW, ('%s is a reference-only view - tessellation and swept '
+                        'solids are in scope, Boolean/CSG and NURBS are not, so '
+                        'it coordinates but will not carry editable geometry '
+                        'downstream' % shown)
+    return PASS, '%s, consistent with %s' % (shown, schema)
+
+
+# IfcMapConversion and IfcProjectedCRS were introduced in IFC4.  A model on an
+# older schema cannot carry either, so it can never reach LoGeoRef 50 and must
+# be told to change schema rather than to fill in a MapConversion it has no
+# place to put.
+NO_MAPCONV_SCHEMAS = ('IFC2X3', 'IFC2X2')
+
+
+def can_map_convert(schema):
+    """False when the schema predates IfcMapConversion."""
+    return schema_family(schema) not in NO_MAPCONV_SCHEMAS
+
+
+def enum_val(s):
+    """'.RIGIDSEGMENT.' -> 'RIGIDSEGMENT';  anything else -> None."""
+    m = RE_ENUM.match(s.strip())
+    return m.group(1) if m else None
+
+
+def specific(v):
+    """True when a PredefinedType actually says what the element is."""
+    return v is not None and v not in ('NOTDEFINED', 'USERDEFINED')
+
+
+# PredefinedType attribute index.  Almost every physical element carries it at
+# position 8 - GlobalId, OwnerHistory, Name, Description, ObjectType,
+# ObjectPlacement, Representation, Tag, PredefinedType.  These do not, and
+# reading position 8 on them would report a neighbouring enum as the class:
+# IfcDoor would answer with its OperationType.
+PDT_DEFAULT = 8
+PDT_INDEX = {
+    'IFCDOOR': 10, 'IFCDOORSTANDARDCASE': 10,
+    'IFCWINDOW': 10, 'IFCWINDOWSTANDARDCASE': 10,
+    'IFCSTAIRFLIGHT': 12,          # NumberOfRisers, NumberOfTreads, RiserHeight, TreadLength
+    'IFCREINFORCINGBAR': 12,       # SteelGrade, NominalDiameter, CrossSectionArea, BarLength
+    'IFCREINFORCINGMESH': 17,
+    'IFCDISTRIBUTIONSYSTEM': 6, 'IFCBUILDINGSYSTEM': 5, 'IFCBUILTSYSTEM': 5,
+    # These sit at the default 8, and are pinned so the scan below can never
+    # reach the enum that follows: IfcPile.ConstructionType,
+    # IfcDistributionPort.FlowDirection, IfcTransportElement.OperationType.
+    'IFCPILE': 8, 'IFCDISTRIBUTIONPORT': 8, 'IFCTRANSPORTELEMENT': 8,
+}
+
+# Type objects are uniform: ..., Tag, ElementType, PredefinedType
+TYPE_ELEMTYPE_INDEX = 8
+TYPE_PDT_INDEX = 9
+
+# IFC2x3 gave these classes no PredefinedType at all, so a blank one is the
+# schema's doing rather than the modeller's.  IfcBuildingElementProxy is here
+# because IFC2x3 puts CompositionType in that slot - reading it as a
+# PredefinedType would report every proxy as ELEMENT and call it classified.
+NO_PDT_IFC2X3 = {
+    'IFCWALL', 'IFCWALLSTANDARDCASE', 'IFCBEAM', 'IFCCOLUMN', 'IFCMEMBER',
+    'IFCPLATE', 'IFCBUILDINGELEMENTPROXY', 'IFCDISCRETEACCESSORY',
+    'IFCFASTENER', 'IFCMECHANICALFASTENER', 'IFCBUILDINGELEMENTPART',
+    'IFCFURNISHINGELEMENT', 'IFCFLOWSEGMENT', 'IFCFLOWFITTING',
+    'IFCFLOWTERMINAL', 'IFCFLOWCONTROLLER', 'IFCENERGYCONVERSIONDEVICE',
+}
+
+# Outright proxies: the exporter could not map the element to any IFC class
+# and said so, whatever the PredefinedType then claims.
+PROXY_CLASSES = {
+    'IFCBUILDINGELEMENTPROXY', 'IFCBUILTELEMENT', 'IFCPROXY', 'IFCELEMENT',
+    'IFCDISTRIBUTIONELEMENT',
+}
+
+# Generic supertypes.  Less damning than a proxy - an IFC2x3 MEP export often
+# wrote IfcFlowSegment where IFC4 would write IfcPipeSegment - but still one
+# level short of saying what the element is.
+GENERIC_CLASSES = {
+    'IFCDISTRIBUTIONFLOWELEMENT', 'IFCELEMENTCOMPONENT', 'IFCFLOWSEGMENT',
+    'IFCFLOWFITTING', 'IFCFLOWTERMINAL', 'IFCFLOWCONTROLLER',
+    'IFCFLOWMOVINGDEVICE', 'IFCFLOWSTORAGEDEVICE', 'IFCFLOWTREATMENTDEVICE',
+    'IFCENERGYCONVERSIONDEVICE', 'IFCFURNISHINGELEMENT',
+}
+
+# Logical groupings that carry no geometry and are not classified as elements
+NON_PHYSICAL = {
+    'IFCDISTRIBUTIONSYSTEM', 'IFCBUILDINGSYSTEM', 'IFCBUILTSYSTEM', 'IFCSYSTEM',
+    'IFCGROUP', 'IFCASSET', 'IFCINVENTORY', 'IFCELECTRICALCIRCUIT',
+    'IFCSTRUCTURALANALYSISMODEL',
+}
+
+
+def elem_pdt(cls, args, fam):
+    """PredefinedType of an occurrence -> (value, how).
+
+    'how' is 'index' when the class's own attribute position was used, 'scan'
+    when the layout was unknown and it had to be found by shape, and 'n/a' when
+    the class has no PredefinedType in this schema at all.  Keeping 'how' is
+    what stops an unknown class from being reported as confidently as a known
+    one.
+    """
+    if fam == 'IFC2X3' and cls in NO_PDT_IFC2X3:
+        return None, 'n/a'
+    pinned = cls in PDT_INDEX
+    i = PDT_INDEX.get(cls, PDT_DEFAULT)
+    v = enum_val(arg(args, i))
+    if v is not None:
+        return v, 'index'
+    if pinned:
+        # The layout is known, so an empty slot really is empty.  Scanning on
+        # would report the neighbouring enum - IfcDoor's OperationType,
+        # IfcDistributionPort's FlowDirection - as the PredefinedType.
+        return None, 'index'
+    # Unknown layout.  IfcStairFlight and its like carry extra attributes ahead
+    # of PredefinedType, leaving position 8 blank and the enum further along, so
+    # a blank slot is not yet evidence that the element was left unclassified.
+    for j in range(len(args) - 1, i, -1):
+        v = enum_val(arg(args, j))
+        if v is not None:
+            return v, 'scan'
+    return None, 'index' if arg(args, i) == '$' else 'scan'
+
+
+def classify_elements(model, elems):
+    """Grade every geometric element on IfcClass and PredefinedType.
+
+    An element is only usable downstream if it says what it is, and two things
+    break that without looking wrong in any viewer: an exporter that could not
+    map the element to a real IFC class and fell back to a generic proxy, and a
+    PredefinedType left NOTDEFINED or pushed to USERDEFINED.  A specific
+    PredefinedType on the element's type object counts, because the occurrence
+    inherits it, so both are read before anything is flagged.
+    """
+    rows = []
+    counts = Counter()
+    matrix = Counter()
+    n = 0
+    for e in elems:
+        if e.ifc_class in NON_PHYSICAL:
+            continue
+        n += 1
+        tpdt, telem, tname = model.type_info(e.id)
+        eff, inherited = e.predefined, False
+        if not specific(eff) and specific(tpdt):
+            eff, inherited = tpdt, True
+        named = e.object_type or telem or ''
+
+        if e.ifc_class in PROXY_CLASSES:
+            grade = FIX
+            why = 'exported as a generic proxy, so the model never says what it is'
+            act = ('map the family to a real IFC class in the Revit export - '
+                   'IFC Export Classes, or an IfcExportAs type parameter')
+        elif e.ifc_class in GENERIC_CLASSES:
+            grade = REVIEW
+            why = ('%s is the supertype, one level short of a class that says '
+                   'what this is' % ifc_name(e.ifc_class))
+            act = 'map the family to the specific IFC class in the Revit export'
+        elif e.pdt_source == 'n/a':
+            grade = PASS
+            why = 'no PredefinedType on this class in %s' % model.schema
+            act = ''
+        elif specific(eff):
+            grade = PASS
+            why = eff + (' (inherited from the type)' if inherited else '')
+            act = ''
+        elif 'USERDEFINED' in (e.predefined, tpdt):
+            if not named:
+                grade = REVIEW
+                why = ('USERDEFINED with no ObjectType or ElementType, so '
+                       'nothing states what this element is')
+                act = 'assign a proper PredefinedType, or name the type in ObjectType'
+            else:
+                grade = REVIEW
+                why = 'USERDEFINED, described only as "%s"' % named
+                act = 'set the matching %s PredefinedType' % ifc_name(e.ifc_class)
+        elif 'NOTDEFINED' in (e.predefined, tpdt):
+            grade = REVIEW
+            why = ('NOTDEFINED on the element and its type'
+                   if tpdt == 'NOTDEFINED' else
+                   'NOTDEFINED, with no type to inherit one from')
+            act = 'set a PredefinedType on the Revit type'
+        else:
+            grade = FIX
+            why = 'PredefinedType not written at all'
+            act = 'set a PredefinedType on the Revit type'
+
+        counts[grade] += 1
+        matrix[(e.ifc_class, e.predefined or '(absent)', grade)] += 1
+        if grade != PASS or e.pdt_source == 'scan':
+            rows.append({'id': e.id, 'class': e.ifc_class,
+                         'predefined': e.predefined, 'type_predefined': tpdt,
+                         'object_type': e.object_type, 'type_name': tname or '',
+                         'grade': grade, 'why': why, 'action': act,
+                         'read_by': e.pdt_source})
+
+    rows.sort(key=lambda r: ({FIX: 0, REVIEW: 1, PASS: 2}[r['grade']], r['id']))
+    return {
+        'n': n,
+        'n_classified': counts[PASS],
+        'n_fix': counts[FIX],
+        'n_review': counts[REVIEW],
+        'n_proxy': sum(v for k, v in matrix.items() if k[0] in PROXY_CLASSES),
+        'n_generic': sum(v for k, v in matrix.items() if k[0] in GENERIC_CLASSES),
+        'n_scanned': sum(1 for r in rows if r['read_by'] == 'scan'),
+        'matrix': sorted(((k[0], k[1], k[2], v) for k, v in matrix.items()),
+                         key=lambda x: (x[0], -x[3])),
+        'rows': rows[:5000],
+        'n_rows': len(rows),
+    }
+
+
+def audit_type_objects(model):
+    """An IfcTypeObject with PredefinedType USERDEFINED but no ElementType.
+
+    Revit writes USERDEFINED whenever the family has no IFC equivalent, and
+    leaves ElementType empty.  USERDEFINED itself is legitimate - it is the
+    escape hatch the schema provides - but with ElementType blank the pair says
+    nothing at all about what the type is, which is what makes it worth review
+    rather than a silent pass.
+    """
+    bad = []
+    for tid in model.type_ids:
+        t, a = model.ent[tid]
+        if enum_val(arg(a, TYPE_PDT_INDEX)) != 'USERDEFINED':
+            continue
+        if sval(arg(a, TYPE_ELEMTYPE_INDEX)):
+            continue
+        bad.append({'id': tid, 'class': t, 'name': sval(arg(a, 2)) or ''})
+    return bad
 
 
 # ----------------------------------------------------------------------------
@@ -329,6 +683,8 @@ KEEP = {
     'IFCRECTANGLEPROFILEDEF', 'IFCRECTANGLEHOLLOWPROFILEDEF', 'IFCCIRCLEPROFILEDEF',
     'IFCCIRCLEHOLLOWPROFILEDEF', 'IFCISHAPEPROFILEDEF', 'IFCINDEXEDPOLYCURVE',
     'IFCPOLYLINE', 'IFCGEOMETRICSET', 'IFCGEOMETRICCURVESET', 'IFCFACETEDBREP',
+    'IFCCOMPOSITECURVE', 'IFCCOMPOSITECURVESEGMENT', 'IFCTRIMMEDCURVE',
+    'IFCCIRCLE', 'IFCELLIPSE', 'IFCLINE',
     'IFCADVANCEDBREP', 'IFCCLOSEDSHELL', 'IFCOPENSHELL', 'IFCFACE',
     'IFCFACEOUTERBOUND', 'IFCFACEBOUND', 'IFCPOLYLOOP', 'IFCSHELLBASEDSURFACEMODEL',
     'IFCFACEBASEDSURFACEMODEL', 'IFCBOOLEANRESULT', 'IFCBOOLEANCLIPPINGRESULT',
@@ -357,6 +713,51 @@ def dms(s):
 # Model loading
 # ----------------------------------------------------------------------------
 
+CLOUD_ONLY = 0x400000        # FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+OFFLINE = 0x1000             # FILE_ATTRIBUTE_OFFLINE
+
+
+def is_cloud_only(path):
+    """True for a OneDrive / cloud placeholder that is not on this disk yet."""
+    try:
+        a = os.stat(path).st_file_attributes
+    except (AttributeError, OSError):
+        return False
+    return bool(a & (CLOUD_ONLY | OFFLINE))
+
+
+def ensure_local(path, tries=4, delay=3.0):
+    """Force a cloud-only file onto disk before the parse pass.
+
+    OneDrive Files On-Demand hydrates a placeholder on first access.  While
+    that is in flight a read can fail outright with OSError 22, which is how a
+    package audit died on its first model with a message naming neither the
+    cause nor the file.  Reading the first and last byte pulls the whole file
+    down; the retry covers a hydration that has not finished yet.
+    """
+    err = None
+    for i in range(tries):
+        try:
+            with open(path, 'rb') as f:
+                f.read(4096)
+                if os.path.getsize(path) > 4096:
+                    f.seek(-1, os.SEEK_END)     # the last byte forces the rest
+                    f.read(1)
+            return
+        except OSError as e:
+            err = e
+            # only a hydration that is still in flight gets better on a retry;
+            # a permission or path error will not, so do not sit on it
+            if i + 1 >= tries or not is_cloud_only(path):
+                break
+            time.sleep(delay * (i + 1))
+    if is_cloud_only(path):
+        raise IOError('stored in the cloud and could not be downloaded - in File '
+                      'Explorer, right-click it and choose "Always keep on this '
+                      'device", then run the audit again (%s)' % err)
+    raise IOError('%s' % err)
+
+
 class Model:
     """A parsed IFC file: only the entities needed for geolocation + geometry."""
 
@@ -384,6 +785,13 @@ class Model:
         self.inst_type = {}           # element id -> IfcTypeObject id
         self.decomposed = set()       # ids that aggregate/nest children
         self.n_containers = 0         # geometry-less aggregates, audited via children
+        self.type_ids = []            # IfcTypeObject ids, in file order
+        self.view_def = None          # ViewDefinition [...] from FILE_DESCRIPTION
+        self.exchange_req = None      # ExchangeRequirement [...]
+        self.coord_ref = None         # CoordinateReference [...]
+        self.authoring_tool = None    # FILE_NAME originating system
+        self.preprocessor = None      # FILE_NAME preprocessor version
+        self.export_date = None       # FILE_NAME time stamp
         self.unhandled = Counter()
         self._bbcache = {}
         self._mcache = {}
@@ -392,6 +800,7 @@ class Model:
     # -- parsing -------------------------------------------------------------
 
     def _load(self):
+        ensure_local(self.path)
         ctx_ids = []
         proj_units = None
         raw_elems = []
@@ -406,6 +815,7 @@ class Model:
                         h = ''.join(head)
                         m = re.search(r"FILE_SCHEMA\s*\(\s*\(\s*'([^']+)'", h)
                         self.schema = m.group(1) if m else '?'
+                        self._read_header(h)
                     continue
                 if not line or line[0] != '#':
                     continue
@@ -485,6 +895,14 @@ class Model:
                 guid = mg.group(1)
                 eid = int(line[1:eq])
                 self._count_guid(guid, eid, typ)
+                if typ.endswith('TYPE') and not typ.startswith('IFCREL') \
+                        and 'PROPERTY' not in typ and 'MATERIAL' not in typ:
+                    # Type objects hold the PredefinedType an occurrence can
+                    # inherit and the family name duplicate grading falls back
+                    # to.  Skipping them left both lookups permanently empty.
+                    self.ent[eid] = (typ, split_args(parse_record(line)[2]))
+                    self.type_ids.append(eid)
+                    continue
                 if typ.endswith('TYPE') or typ.startswith('IFCREL') \
                         or 'PROPERTY' in typ or 'MATERIAL' in typ or typ in EXCLUDE:
                     continue
@@ -496,6 +914,41 @@ class Model:
         self._build_elements(raw_elems)
         if self.site_place and self.site_place[0] is not None:
             self.site_origin = self.placement(self.site_place[0])[1]
+
+    def _read_header(self, h):
+        """What the authoring tool declared about this export.
+
+        FILE_DESCRIPTION carries the MVD the exporter claims to follow, and
+        FILE_NAME carries which tool wrote the file.  Both decide how much of
+        the model a receiving system is entitled to expect, and neither is
+        visible anywhere in the model tree.
+        """
+        d = re.search(r"FILE_DESCRIPTION\s*\((.*?)\)\s*,\s*'[^']*'\s*\)",
+                      h, re.S)
+        desc = d.group(1) if d else h
+        for rx, attr in ((RE_VIEWDEF, 'view_def'),
+                         (RE_EXCHANGE, 'exchange_req'),
+                         (RE_COORDREF, 'coord_ref')):
+            m = rx.search(desc)
+            if m:
+                setattr(self, attr, m.group(1).strip() or None)
+        n = re.search(r"FILE_NAME\s*\((.*?)\)\s*;", h, re.S)
+        if n:
+            a = split_args(n.group(1))
+            self.export_date = sval(arg(a, 1))
+            self.preprocessor = sval(arg(a, 4))
+            self.authoring_tool = sval(arg(a, 5))
+
+    def type_info(self, eid):
+        """(PredefinedType, ElementType, type name) of an element's IfcTypeObject."""
+        tid = self.inst_type.get(eid)
+        e = self.ent.get(tid) if tid is not None else None
+        if not e or not e[0].endswith('TYPE'):
+            return None, None, None
+        a = e[1]
+        return (enum_val(arg(a, TYPE_PDT_INDEX)),
+                sval(arg(a, TYPE_ELEMTYPE_INDEX)),
+                sval(arg(a, 2)))
 
     IMPERIAL_MM = {'FOOT': 304.8, 'FEET': 304.8, 'INCH': 25.4, 'INCHES': 25.4,
                    'YARD': 914.4, 'MILE': 1609344.0}
@@ -596,8 +1049,10 @@ class Model:
             break
 
     def _build_elements(self, raw_elems):
+        fam = schema_family(self.schema)
         for eid, typ, line in raw_elems:
             a = split_args(parse_record(line)[2])
+            pdt, pdt_how = elem_pdt(typ, a, fam)
             name = sval(arg(a, 2)) or ''
             otype = sval(arg(a, 4)) or ''
             place = ref(arg(a, 5))
@@ -611,7 +1066,8 @@ class Model:
             if shape is None and eid in self.decomposed:
                 self.n_containers += 1
                 continue
-            self.elements.append(Element(eid, typ, name, otype, tag, place, shape))
+            self.elements.append(
+                Element(eid, typ, name, otype, tag, place, shape, pdt, pdt_how))
         # instance -> type object, for a family-name fallback
         for (t, a) in list(self.ent.values()):
             if t == 'IFCRELDEFINESBYTYPE':
@@ -687,6 +1143,8 @@ class Model:
         """Local 2D bbox of a profile, in the profile's own plane (z = 0)."""
         e = self.ent.get(i)
         if not e:
+            if i is not None:
+                self.unhandled['(profile not parsed)'] += 1
             return None
         t, a = e
         if t in ('IFCARBITRARYCLOSEDPROFILEDEF', 'IFCARBITRARYPROFILEDEFWITHVOIDS',
@@ -709,8 +1167,15 @@ class Model:
         return None
 
     def _curve_bb(self, i, depth):
+        if depth > 24:
+            return None
         e = self.ent.get(i)
-        if not e or depth > 24:
+        if not e:
+            # an entity outside KEEP is never parsed, so it used to disappear
+            # here without being counted - that is how a fifth of a model
+            # resolved to nothing while 'unresolved' stayed empty
+            if i is not None:
+                self.unhandled['(curve not parsed)'] += 1
             return None
         t, a = e
         if t == 'IFCINDEXEDPOLYCURVE':
@@ -720,6 +1185,42 @@ class Model:
             return bb_points(p for p in (self._pt(r) for r in reflist(arg(a, 0))) if p)
         if t == 'IFCPOLYLOOP':
             return bb_points(p for p in (self._pt(r) for r in reflist(arg(a, 0))) if p)
+
+        # Revit writes rolled and formed steel sections as a composite curve of
+        # line and arc segments, so a channel or angle has no extent at all
+        # without these.
+        if t == 'IFCCOMPOSITECURVE':
+            b = None
+            for r in reflist(arg(a, 0)):
+                b = bb_union(b, self._curve_bb(r, depth + 1))
+            return b
+
+        if t == 'IFCCOMPOSITECURVESEGMENT':
+            return self._curve_bb(ref(arg(a, 2)), depth + 1)
+
+        if t == 'IFCTRIMMEDCURVE':
+            # cartesian trim points bound the arc exactly; a parametric trim
+            # falls back to the whole basis curve, which over-states an arc by
+            # at most its radius - harmless at bounding-box resolution
+            pts = [p for p in (self._pt(r) for r in
+                               reflist(arg(a, 1)) + reflist(arg(a, 2))) if p]
+            if pts:
+                return bb_points(pts)
+            return self._curve_bb(ref(arg(a, 0)), depth + 1)
+
+        if t in ('IFCCIRCLE', 'IFCELLIPSE'):
+            c = self._axis3d(ref(arg(a, 0)))[1]
+            r1 = num(arg(a, 1)) or 0.
+            r2 = (num(arg(a, 2)) or r1) if t == 'IFCELLIPSE' else r1
+            rz = max(r1, r2)
+            return (c[0] - r1, c[1] - r2, c[2] - rz,
+                    c[0] + r1, c[1] + r2, c[2] + rz)
+
+        if t == 'IFCLINE':
+            # unbounded on its own; only its origin is a usable extent
+            p = self._pt(ref(arg(a, 0)))
+            return bb_points([p]) if p else None
+
         self.unhandled[t] += 1
         return None
 
@@ -771,8 +1272,21 @@ class Model:
             return (o[0], o[1], o[2], o[0] + x, o[1] + y, o[2] + z)
 
         if t in ('IFCBOOLEANRESULT', 'IFCBOOLEANCLIPPINGRESULT'):
-            # first operand only: the second is a cutting tool and may be huge
-            return self.item_bb(ref(arg(a, 1)), depth + 1)
+            # First operand only: the second is a cutting tool and may be huge.
+            # Revit writes one boolean per opening, chained through FirstOperand,
+            # so a floor slab with 41 penetrations nests 41 deep.  Walk that
+            # chain iteratively: recursing hits the runaway-recursion guard and
+            # the element is then reported as having no geometry at all, which
+            # lands it on the placement origin and looks like a floating element.
+            j, hops = ref(arg(a, 1)), 0
+            while hops < 4096:
+                e2 = self.ent.get(j)
+                if not e2 or e2[0] not in ('IFCBOOLEANRESULT',
+                                           'IFCBOOLEANCLIPPINGRESULT'):
+                    break
+                j = ref(arg(e2[1], 1))
+                hops += 1
+            return self.item_bb(j, depth + 1)
 
         if t in ('IFCGEOMETRICSET', 'IFCGEOMETRICCURVESET', 'IFCCLOSEDSHELL',
                  'IFCOPENSHELL', 'IFCSHELLBASEDSURFACEMODEL', 'IFCFACEBASEDSURFACEMODEL'):
@@ -844,9 +1358,10 @@ class Model:
 
 class Element:
     __slots__ = ('id', 'ifc_class', 'name', 'object_type', 'tag', 'place_id',
-                 'shape_id', 'bbox', 'source')
+                 'shape_id', 'bbox', 'source', 'predefined', 'pdt_source')
 
-    def __init__(self, eid, cls, name, otype, tag, place_id, shape_id):
+    def __init__(self, eid, cls, name, otype, tag, place_id, shape_id,
+                 predefined=None, pdt_source='index'):
         self.id = eid
         self.ifc_class = cls
         self.name = name
@@ -856,6 +1371,8 @@ class Element:
         self.shape_id = shape_id
         self.bbox = None
         self.source = 'none'    # 'body' | 'placement' | 'none'
+        self.predefined = predefined    # PredefinedType enum, None when absent
+        self.pdt_source = pdt_source    # 'index' | 'scan' | 'n/a'
 
     def type_key(self, model):
         """The 'same element / family name' identity used for duplicate grading."""
@@ -1092,21 +1609,39 @@ def find_floating(elems, centres, u, opt):
         thr_z, _, _ = robust_limit(dz, opt.float_k, opt.float_min)
         how_z = 'auto'
 
+    # the spread of everything the fence accepted - the yardstick for 'far'
+    keep_p = [p for p, v in zip(dp, dz) if p <= thr_p and v <= thr_z]
+    keep_z = [v for p, v in zip(dp, dz) if p <= thr_p and v <= thr_z]
+    bulk_p = max(keep_p) if keep_p else thr_p
+    bulk_z = max(keep_z) if keep_z else thr_z
+
     out = []
     for e, pd, vd in zip(elems, dp, dz):
         if pd <= thr_p and vd <= thr_z:
             continue
         why = []
+        ratio = 0.0
         if pd > thr_p:
             why.append('%.0f m from centre in plan' % pd)
+            ratio = max(ratio, pd / bulk_p if bulk_p > 1e-9 else float('inf'))
         if vd > thr_z:
             why.append('%.1f m from centre vertically' % vd)
+            ratio = max(ratio, vd / bulk_z if bulk_z > 1e-9 else float('inf'))
+        detached = ratio > opt.float_detach
         out.append({'id': e.id, 'class': e.ifc_class, 'type': e.label()[:70],
                     'plan_m': round(pd, 1), 'vert_m': round(vd, 1),
-                    'reason': ' and '.join(why)})
+                    'reason': ' and '.join(why),
+                    'grade': FIX if detached else REVIEW,
+                    'spread_ratio': round(ratio, 1) if ratio != float('inf') else None,
+                    'clear_m': round(max(pd - bulk_p, vd - bulk_z), 1),
+                    'verdict': 'detached from the model' if detached
+                               else 'within reach of the model - check it '
+                                    'against the architectural and structural '
+                                    'envelope'})
     out.sort(key=lambda r: -(r['plan_m'] ** 2 + r['vert_m'] ** 2))
     thresholds = {'plan_m': round(thr_p, 1), 'vertical_m': round(thr_z, 1),
                   'plan_source': how_p, 'vertical_source': how_z,
+                  'bulk_plan_m': round(bulk_p, 1), 'bulk_vertical_m': round(bulk_z, 1),
                   'median_plan_m': round(median(dp), 1),
                   'median_vertical_m': round(median(dz), 1)}
     return out, (cx, cy, cz), thresholds
@@ -1253,6 +1788,17 @@ def georef_advice(res, lab):
         out.append('  from "identity because nobody filled it in", and any tool that')
         out.append('  re-bases the site placement silently loses the georeference.')
         out.append('')
+    stuck = [r for r in below if not can_map_convert(r['schema'])]
+    if stuck:
+        out.append('  %s on a schema that predates IfcMapConversion:'
+                   % plural(len(stuck), 'model'))
+        for r in stuck:
+            out.append('    %-8s %s' % (lab[r['file']], r['schema']))
+        out.append('  No export setting georeferences these. IfcMapConversion and')
+        out.append('  IfcProjectedCRS arrive with IFC4, so the steps below only')
+        out.append('  take effect once the export target is IFC4 or later. Change')
+        out.append('  the schema first, then georeference.')
+        out.append('')
     out.append('How to fix it (Revit, which produced these files)')
     out.append('  1. Manage > Coordinates > Specify Coordinates at Point - give the')
     out.append('     survey point its true E/N/elevation.')
@@ -1372,9 +1918,21 @@ def audit_file(path, opt):
                for i in (0, 1) for j in (0, 1) for k in (0, 1)]
         world_env = [round(v, 3) for v in bb_points(pts)]
 
+    # -- IfcClass / PredefinedType ------------------------------------------
+    cls = classify_elements(m, elems)
+    bad_types = audit_type_objects(m)
+
     site = m.site[0] if m.site else (None, None, None, '')
     return {
         'file': m.name, 'schema': m.schema,
+        'view_definition': m.view_def, 'exchange_requirement': m.exchange_req,
+        'coordinate_reference': m.coord_ref, 'authoring_tool': m.authoring_tool,
+        'preprocessor': m.preprocessor, 'export_date': m.export_date,
+        'view_status': list(view_status(m.view_def, m.schema, m.authoring_tool)),
+        'classification': cls,
+        'bad_type_objects': bad_types[:2000],
+        'n_bad_type_objects': len(bad_types),
+        'n_type_objects': len(m.type_ids),
         'length_unit': m.unit_name, 'unit_to_mm': m.to_mm, 'unit_assumed_mm': unit_assumed,
         'true_north_deg': m.true_north, 'wcs_offset': m.wcs_offset,
         'ref_lat': site[0], 'ref_long': site[1], 'ref_elev': site[2],
@@ -1405,6 +1963,8 @@ def audit_file(path, opt):
         'interferences': inter[:5000], 'n_interferences': len(inter),
         'n_interference_skipped': n_oversize,
         'n_floating': len(floating), 'floating': floating[:40],
+        'n_detached': sum(1 for f in floating if f['grade'] == FIX),
+        'n_outlying': sum(1 for f in floating if f['grade'] == REVIEW),
     }
 
 
@@ -1467,7 +2027,23 @@ for _n in ('Wall', 'WallStandardCase', 'Slab', 'Beam', 'Column', 'Footing', 'Pil
            'UnitaryEquipment', 'Fan', 'Filter', 'HeatExchanger', 'Humidifier',
            'CoolingTower', 'Compressor', 'Condenser', 'Evaporator', 'Damper',
            'ProtectiveDevice', 'MotorConnection', 'Controller', 'Alarm', 'Interceptor',
-           'Stack Terminal', 'StackTerminal', 'WasteTerminal', 'Grid', 'Annotation'):
+           'Stack Terminal', 'StackTerminal', 'WasteTerminal', 'Grid', 'Annotation',
+           # generic supertypes an IFC2x3 MEP export lands on
+           'FlowSegment', 'FlowFitting', 'FlowTerminal', 'FlowController',
+           'FlowMovingDevice', 'FlowStorageDevice', 'FlowTreatmentDevice',
+           'EnergyConversionDevice', 'DistributionFlowElement',
+           'DistributionChamberElement', 'ElementAssembly', 'ElementComponent',
+           # the rest of the IFC4 / IFC4x3 classes a building model reaches for
+           'FlowMeter', 'CommunicationsAppliance', 'AudioVisualAppliance',
+           'MedicalDevice', 'ElectricFlowStorageDevice', 'SolarDevice',
+           'SpaceHeater', 'WasteTerminalType', 'BuiltElement', 'BuildingSystem',
+           'DistributionSystem', 'DistributionPort', 'DistributionBoard',
+           'ElectricTimeControl', 'AirToAirHeatRecovery', 'BurnerType',
+           'CoilType', 'TubeBundle', 'VibrationIsolator', 'Coil', 'Burner',
+           'CivilElement', 'GeographicElement', 'TransportElement',
+           'SystemFurnitureElement', 'Furniture', 'CurtainWall',
+           'BuildingElementProxyType', 'Pile', 'Footing', 'StairFlight',
+           'RampFlight', 'Wall', 'Roof', 'Ceiling'):
     IFC_NAMES['IFC' + _n.replace(' ', '').upper()] = 'Ifc' + _n.replace(' ', '')
 
 
@@ -1478,6 +2054,11 @@ def ifc_name(cls):
     known = IFC_NAMES.get(cls.upper())
     if known:
         return known
+    # IFCVALVETYPE -> IfcValveType, off the occurrence class already listed
+    if cls.upper().endswith('TYPE'):
+        base = IFC_NAMES.get(cls.upper()[:-4])
+        if base:
+            return base + 'Type'
     if cls.upper().startswith('IFC'):
         return 'Ifc' + cls[3:].capitalize()
     return cls.capitalize()
@@ -1584,10 +2165,51 @@ def collect_findings(res, opt, lab):
     def add(sev, area, text):
         f.append({'sev': sev, 'area': area, 'text': text})
 
-    # --- schema / units / CRS ---
-    schemas = sorted(set(r['schema'] for r in res))
-    if len(schemas) > 1:
-        add(FIX, 'Schema', 'mixed: ' + ', '.join(schemas))
+    # a model that could not be read is not a model that passed
+    for name, why in getattr(opt, 'skipped', ()):
+        add(FIX, 'Unreadable', '%s was not audited: %s' % (name, why))
+
+    # --- schema: the one that decides whether the package federates at all ---
+    by_s = defaultdict(list)
+    for r in res:
+        by_s[r['schema']].append(lab[r['file']])
+    schemas = sorted(by_s)
+    if opt.expect_schema:
+        target = opt.expect_schema.upper()
+    else:
+        # no stated target: the majority schema is what the package is trying
+        # to be, and ties break towards the later schema
+        target = max(schemas, key=lambda s: (len(by_s[s]), s))
+    tfam = schema_family(target)
+    odd = [(s, by_s[s]) for s in schemas if schema_family(s) != tfam]
+
+    mixed_schema = bool(odd)
+    if odd:
+        stranded = [l for s, ls in odd if not can_map_convert(s) for l in ls]
+        note = ''
+        if stranded and can_map_convert(target):
+            note = ('; %s cannot be georeferenced at all until re-exported - '
+                    'IfcMapConversion and IfcProjectedCRS do not exist before '
+                    'IFC4, so no export setting will reach LoGeoRef 50'
+                    % ', '.join(stranded))
+        who = '; '.join('%s %s %s' % (', '.join(ls),
+                                      'is' if len(ls) == 1 else 'are', s)
+                        for s, ls in odd)
+        if len(odd) == len(schemas):
+            # nothing is on target - the package is consistent, just not with
+            # the schema it was asked for, so the federation wording is wrong
+            add(FIX, 'Schema', '%s was required but %s%s' % (target, who, note))
+        else:
+            add(FIX, 'Schema',
+                'the package is %s but %s - a federated set read against two '
+                'schemas gets different entity classes, property sets and '
+                'georeferencing per model%s' % (target, who, note))
+    elif len(schemas) > 1:
+        add(REVIEW, 'Schema', 'same schema, mixed addenda: ' + '; '.join(
+            '%s in %s' % (s, ', '.join(by_s[s])) for s in schemas))
+    elif opt.expect_schema and schema_family(schemas[0]) != tfam:
+        add(FIX, 'Schema', 'all models are %s, but %s was required'
+            % (schemas[0], opt.expect_schema))
     else:
         add(PASS, 'Schema', '%s throughout' % schemas[0])
 
@@ -1601,23 +2223,72 @@ def collect_findings(res, opt, lab):
     else:
         add(PASS, 'Units', '%s throughout' % units[0])
 
-    crss = sorted(set(str(r['projected_crs']) for r in res))
-    if len(crss) > 1:
-        add(FIX, 'CRS', 'mixed: ' + ', '.join(crss))
-    elif crss[0] == 'None':
+    named = sorted(set(r['projected_crs'] for r in res if r['projected_crs']))
+    blank = [lab[r['file']] for r in res if not r['projected_crs']]
+    pre4 = {lab[r['file']] for r in res if not can_map_convert(r['schema'])}
+    if len(named) > 1:
+        add(FIX, 'CRS', 'mixed: ' + ', '.join(named))
+    elif not named:
         add(REVIEW, 'CRS', 'no IfcProjectedCRS declared in any model')
+    elif not blank:
+        add(PASS, 'CRS', '%s throughout' % named[0])
+    elif set(blank) <= pre4:
+        # not a disagreement about the CRS - those models have nowhere to put
+        # one, which the schema finding already covers
+        add(REVIEW, 'CRS', '%s wherever the schema allows one; %s cannot carry '
+            'an IfcProjectedCRS at all' % (named[0], ', '.join(blank)))
     else:
-        add(PASS, 'CRS', '%s throughout' % crss[0])
+        add(FIX, 'CRS', '%s in some models, none in %s'
+            % (named[0], ', '.join(blank)))
+
+    # --- model view definition ---
+    rank = {FIX: 0, REVIEW: 1, PASS: 2}
+    views = sorted(set(r['view_definition'] or '(none declared)' for r in res))
+    if len(views) > 1 and not mixed_schema:
+        # when the schemas differ this is a restatement of that, because the
+        # exporter picks the string from the schema
+        add(FIX, 'View definition', 'mixed: ' + ', '.join(views))
+    if opt.expect_view:
+        want = split_view(opt.expect_view)[0]
+        off = [lab[r['file']] for r in res
+               if split_view(r['view_definition'] or '')[0] != want]
+        if off:
+            add(FIX, 'View definition',
+                'not exported as %s: %s' % (opt.expect_view, ', '.join(off)))
+    # a model the schema finding already named does not need a second finding
+    # restating it as an MVD problem; grade the view on the models that are not
+    # already accounted for
+    named = {l for s, ls in odd for l in ls}
+    cand = [r for r in res if lab[r['file']] not in named] or res
+    worst = min(cand, key=lambda r: rank[r['view_status'][0]])
+    sev, text = worst['view_status']
+    add(sev, 'View definition',
+        text if (len(cand) == 1 or sev == PASS)
+        else '%s: %s' % (lab[worst['file']], text))
 
     # --- georeferencing ---
     st = {r['file']: r['map_conversion_status'] for r in res}
-    n_set = sum(1 for v in st.values() if v == 'set')
-    n_ph = sum(1 for v in st.values() if v == 'placeholder')
-    n_abs = sum(1 for v in st.values() if v == 'absent')
     lv = {r['file']: georef_level(r) for r in res}
-    worst_lv = min(lv.values())
-    if worst_lv >= 50:
-        add(PASS, 'Georeferencing', 'IfcMapConversion + IfcProjectedCRS in all %d models' % n)
+    stuck = [lab[r['file']] for r in res
+             if not can_map_convert(r['schema']) and georef_level(r) < 50]
+    if stuck:
+        add(FIX, 'Georeferencing',
+            '%s on a pre-IFC4 schema, which has no IfcMapConversion or '
+            'IfcProjectedCRS - re-export as IFC4 or later first, because no '
+            'georeferencing setting can lift %s to LoGeoRef 50'
+            % (plural(len(stuck), 'model'), 'it' if len(stuck) == 1 else 'them'))
+    # the remaining grade is about models an export setting can still fix, so a
+    # stranded model does not drag the whole package to its own level twice
+    fixable = [r for r in res if can_map_convert(r['schema'])]
+    worst_lv = min([lv[r['file']] for r in fixable] or [50])
+    n_ph = sum(1 for r in fixable if st[r['file']] == 'placeholder')
+    n_abs = sum(1 for r in fixable if st[r['file']] == 'absent')
+    if not fixable:
+        pass
+    elif worst_lv >= 50:
+        add(PASS, 'Georeferencing',
+            'IfcMapConversion + IfcProjectedCRS in all %d models'
+            % len(fixable))
     elif worst_lv >= 30:
         # positioned, but by a mechanism that carries no declaration of intent
         add(REVIEW, 'Georeferencing',
@@ -1714,13 +2385,49 @@ def collect_findings(res, opt, lab):
         add(FIX, 'Geometry', 'geometry unresolved for a large share of %s'
             % ', '.join('%s (%.0f%% resolved)' % l for l in low))
 
+    # --- IfcClass / PredefinedType ---
+    prox = [(lab[r['file']], r['classification']['n_proxy'])
+            for r in res if r['classification']['n_proxy']]
+    if prox:
+        add(FIX, 'Proxies', '%s left as a generic proxy in %s - the exporter '
+            'could not map them to an IFC class, so nothing downstream knows '
+            'what they are'
+            % (plural(sum(p[1] for p in prox), 'element'), brief(prox)))
+
+    cls_pct = [(lab[r['file']],
+                100.0 * r['classification']['n_classified'] / r['classification']['n'])
+               for r in res if r['classification']['n']]
+    low_cls = [c for c in cls_pct if c[1] < opt.min_classified * 100]
+    if low_cls:
+        add(REVIEW, 'Classification',
+            'PredefinedType missing or unspecific on %s'
+            % ', '.join('%s (%.0f%% classified)' % c for c in low_cls))
+    elif not prox and cls_pct:
+        add(PASS, 'Classification', 'IfcClass and PredefinedType set throughout')
+
+    bt = [(lab[r['file']], r['n_bad_type_objects'])
+          for r in res if r['n_bad_type_objects']]
+    if bt:
+        add(REVIEW, 'Schema rule', '%s with PredefinedType USERDEFINED and no '
+            'ElementType in %s - USERDEFINED is allowed, but with ElementType '
+            'blank nothing states what the type is; assign a proper '
+            'PredefinedType, or name the type in ElementType'
+            % (plural(sum(b[1] for b in bt), 'type object'), brief(bt)))
+
     # --- floating ---
-    fl = [(lab[r['file']], r['n_floating']) for r in res if r['n_floating']]
-    if fl:
-        add(FIX, 'Floating', '%s far outside the model in %s'
-            % (plural(sum(x[1] for x in fl), 'element'),
-               brief(fl)))
-    else:
+    det = [(lab[r['file']], r['n_detached']) for r in res if r['n_detached']]
+    if det:
+        add(FIX, 'Floating', '%s detached from the model in %s - displaced by '
+            'more than %g times the spread of everything else'
+            % (plural(sum(x[1] for x in det), 'element'), brief(det),
+               opt.float_detach))
+    out_ly = [(lab[r['file']], r['n_outlying']) for r in res if r['n_outlying']]
+    if out_ly:
+        add(REVIEW, 'Floating', '%s outside the usual envelope of %s but still '
+            'within reach of it - check each against the architectural and '
+            'structural envelope before moving anything'
+            % (plural(sum(x[1] for x in out_ly), 'element'), brief(out_ly)))
+    if not det and not out_ly:
         add(PASS, 'Floating', 'none found')
 
     # --- interferences (informational) ---
@@ -1782,11 +2489,13 @@ def report(res, opt):
     if any(r['unit_assumed_mm'] for r in res):
         print('  * length unit could not be read; millimetres assumed')
 
+    _export_section(res, opt, lab, lw)
     _geo_section(res, opt, lab, lw)
     _dup_section(res, opt, lab, lw)
     if opt.clash:
         _clash_section(res, opt, lab, lw)
     _float_section(res, opt, lab, lw)
+    _class_section(res, opt, lab, lw)
     _diag_section(res, opt, lab, lw)
     print('')
 
@@ -1961,6 +2670,8 @@ def _float_section(res, opt, lab, lw):
     if not any(r['n_floating'] for r in res):
         return
     section('FLOATING / OUT-OF-BUILDING ELEMENTS')
+    print('  [!] detached from the model   [?] outlying, but within reach of it')
+    print('  "clear" is the gap to the nearest element the fence accepted')
     for r in res:
         if not r['n_floating']:
             continue
@@ -1970,10 +2681,128 @@ def _float_section(res, opt, lab, lw):
               % (lab[r['file']], plural(r['n_floating'], 'element'),
                  t['plan_m'], t['vertical_m']))
         for fl in r['floating'][:opt.max_rows]:
-            print('    [!] #%-8d %-22s %-34s %s'
-                  % (fl['id'], ifc_name(fl['class']), fl['type'][:34], fl['reason']))
+            print('    [%s] #%-8d %-20s %-24s %-30s %s'
+                  % (fl['grade'], fl['id'], ifc_name(fl['class'])[:20],
+                     fl['type'][:24], fl['reason'],
+                     '%.1f m clear' % fl['clear_m']))
         if r['n_floating'] > opt.max_rows:
             print('    ... %d more' % (r['n_floating'] - opt.max_rows))
+
+
+
+def _export_section(res, opt, lab, lw):
+    section('EXPORT SETUP   (what the authoring tool wrote into the file header)')
+    vw = max([len(r['view_definition'] or '-') for r in res]
+             + [len('view definition')])
+    print('  %-*s %-*s %s' % (lw, 'model', vw, 'view definition', 'exported by'))
+    for r in res:
+        print(('  %-*s %-*s %s' % (lw, lab[r['file']], vw,
+                                   r['view_definition'] or '-',
+                                   r['authoring_tool'] or '-')).rstrip())
+    print('')
+    # models that share a verdict share a line; nine copies of the same
+    # exporter note buries the one model that says something different
+    by_text = []
+    for r in res:
+        sev, text = r['view_status']
+        for e in by_text:
+            if e[0] == sev and e[1] == text:
+                e[2].append(lab[r['file']])
+                break
+        else:
+            by_text.append([sev, text, [lab[r['file']]]])
+    for sev, text, who in by_text:
+        head = ', '.join(who)
+        if len(head) > lw:
+            print('  %-4s %s' % ('[%s]' % sev, head))
+            print('       %s' % wrap(text, SECTION_W - 8, 7))
+        else:
+            print('  %-4s %-*s %s' % ('[%s]' % sev, lw, head,
+                                      wrap(text, SECTION_W - lw - 9, lw + 8)))
+    groups = []
+    for r in res:
+        bits = []
+        if r['exchange_requirement']:
+            bits.append('exchange requirement: %s' % r['exchange_requirement'])
+        if r['coordinate_reference']:
+            bits.append('coordinates: %s' % r['coordinate_reference'])
+        if not bits:
+            continue
+        key = '; '.join(bits)
+        for g in groups:
+            if g[0] == key:
+                g[1].append(lab[r['file']])
+                break
+        else:
+            groups.append([key, [lab[r['file']]]])
+    if groups:
+        print('')
+        for key, who in groups:
+            head = ', '.join(who)
+            if len(head) > lw:
+                print('  %s' % head)
+                print('     %s' % wrap(key, SECTION_W - 6, 5))
+            else:
+                print('  %-*s %s' % (lw, head,
+                                     wrap(key, SECTION_W - lw - 4, lw + 3)))
+
+
+def _class_section(res, opt, lab, lw):
+    section('CLASSIFICATION   (IfcClass and PredefinedType on geometric elements)')
+    print('  %-*s %-22s %s' % (lw, 'model', 'classified', 'what is left'))
+    for r in res:
+        c = r['classification']
+        if not c['n']:
+            print('  %-*s %s' % (lw, lab[r['file']], 'no geometric elements'))
+            continue
+        pct = 100.0 * c['n_classified'] / c['n']
+        bits = []
+        if c['n_proxy']:
+            bits.append('%d generic proxy' % c['n_proxy'])
+        if c['n_fix'] - c['n_proxy'] > 0:
+            bits.append('%d with no PredefinedType or ObjectType'
+                        % (c['n_fix'] - c['n_proxy']))
+        if c['n_generic']:
+            bits.append('%d on a generic supertype' % c['n_generic'])
+        if c['n_review'] - c['n_generic'] > 0:
+            bits.append('%d USERDEFINED or NOTDEFINED'
+                        % (c['n_review'] - c['n_generic']))
+        flag = ' [!]' if pct < opt.min_classified * 100 else ''
+        print(('  %-*s %-22s %s%s' % (
+            lw, lab[r['file']], '%d/%d  (%.0f%%)' % (c['n_classified'], c['n'], pct),
+            ', '.join(bits) or 'nothing', flag)).rstrip())
+
+    for r in res:
+        bad = [m for m in r['classification']['matrix'] if m[2] != PASS]
+        if not bad:
+            continue
+        print('')
+        print('  %s' % lab[r['file']])
+        shown = sorted(bad, key=lambda m: -m[3])[:opt.max_rows]
+        cw = max(len(ifc_name(m[0])) for m in shown)
+        pw = max(len(m[1]) for m in shown)
+        for cls, pdt, g, n in shown:
+            print('    %-4s %-*s %-*s %s'
+                  % ('[%s]' % g, cw, ifc_name(cls), pw, pdt,
+                     plural(n, 'element')))
+        if len(bad) > len(shown):
+            print('    ... and %s more' % plural(len(bad) - len(shown), 'combination'))
+
+    bt = [r for r in res if r['n_bad_type_objects']]
+    if bt:
+        print('')
+        for r in bt:
+            print('  %-*s %s with PredefinedType USERDEFINED and no ElementType'
+                  % (lw, lab[r['file']],
+                     plural(r['n_bad_type_objects'], 'type object')))
+        print('  USERDEFINED is allowed, but with ElementType blank nothing states')
+        print('  what the type is. Assign a proper PredefinedType where one fits.')
+
+    if any(r['classification']['n_scanned'] for r in res):
+        print('')
+        print('  Some classes are not in the tool\'s attribute table and their')
+        print('  PredefinedType was located by shape; those rows are marked in')
+        print('  the Classification sheet.')
 
 
 def _diag_section(res, opt, lab, lw):
@@ -2217,8 +3046,10 @@ def excel_report(path, res, opt):
                    (f['text'], S_WRAP)])
 
     # ---- Models ----
-    s2 = [_hdr('Model', 'File', 'Schema', 'Length unit', 'Elements',
-               'Body geometry', 'Coverage %', 'CRS', 'Ref latitude',
+    s2 = [_hdr('Model', 'File', 'Schema', 'View definition', 'MVD check',
+               'Exchange requirement', 'Exported by', 'Length unit', 'Elements',
+               'Body geometry', 'Coverage %', 'Classified', 'Classified %',
+               'CRS', 'Ref latitude',
                'Local centre X', 'Local centre Y', 'World E', 'World N',
                'Georeferencing', 'MapConv E', 'MapConv N', 'MapConv H',
                'Grid rotation', 'Scale')]
@@ -2227,10 +3058,21 @@ def excel_report(path, res, opt):
         c = r['local_centre_m'] or [None, None, None]
         wc = r['world_centre_ENH'] or [None, None, None]
         cov = (100.0 * r['n_with_body_geometry'] / r['n_elements']) if r['n_elements'] else None
-        s2.append([lab[r['file']], r['file'], r['schema'], r['length_unit'],
+        cl = r['classification']
+        clp = (100.0 * cl['n_classified'] / cl['n']) if cl['n'] else None
+        # an empty model has nothing to classify, so it is never 'below target'
+        s2.append([lab[r['file']], r['file'], r['schema'],
+                   r['view_definition'] or '(none declared)',
+                   (SEV_WORD[r['view_status'][0]], SEV_STYLE[r['view_status'][0]]),
+                   r['exchange_requirement'] or '', r['authoring_tool'] or '',
+                   r['length_unit'],
                    r['n_elements'], r['n_with_body_geometry'],
                    (round(cov, 1) if cov is not None else None,
                     S_FIX if cov is not None and cov < opt.min_geometry * 100 else S_PLAIN),
+                   cl['n_classified'],
+                   (round(clp, 1) if clp is not None else None,
+                    S_FIX if clp is not None and clp < opt.min_classified * 100
+                    else S_PLAIN),
                    r['projected_crs'], r['ref_lat'], c[0], c[1],
                    (wc[0], S_NUM), (wc[1], S_NUM),
                    (r['map_conversion_status'],
@@ -2287,7 +3129,11 @@ def excel_report(path, res, opt):
                    (round(off[0], 1), S_FIX if bad else S_PLAIN),
                    (round(off[1], 1), S_FIX if bad else S_PLAIN),
                    (round(off[2], 1), S_FIX if bad else S_PLAIN),
-                   'Re-export with a real IfcMapConversion' if lvl < 50 else 'OK'])
+                   ('Re-export as IFC4 or later first - this schema has no '
+                    'IfcMapConversion'
+                    if not can_map_convert(r['schema'])
+                    else 'Re-export with a real IfcMapConversion')
+                   if lvl < 50 else 'OK'])
     advice = georef_advice(res, lab)
     if advice:
         sg.append([])
@@ -2297,6 +3143,30 @@ def excel_report(path, res, opt):
 
     sheets = [('Summary', s1, head_row), ('Models', s2, 1),
               ('Georeferencing', sg, 1), ('Duplicates', s3, 1)]
+
+    # ---- Classification ----
+    s7 = [_hdr('Model', 'Severity', 'Element', 'IFC class', 'PredefinedType',
+               'Type PredefinedType', 'ObjectType', 'Type / family',
+               'Read by', 'Why', 'What to do')]
+    for r in res:
+        for row in r['classification']['rows']:
+            s7.append([lab[r['file']],
+                       (SEV_WORD[row['grade']], SEV_STYLE[row['grade']]),
+                       '#%d' % row['id'], ifc_name(row['class']),
+                       row['predefined'] or '(absent)',
+                       row['type_predefined'] or '', row['object_type'] or '',
+                       row['type_name'], row['read_by'],
+                       (row['why'], S_WRAP), (row['action'], S_WRAP)])
+        for b in r['bad_type_objects']:
+            s7.append([lab[r['file']], ('REVIEW', S_REVIEW), '#%d' % b['id'],
+                       ifc_name(b['class']), 'USERDEFINED', '', '', b['name'],
+                       'index',
+                       ('USERDEFINED with no ElementType, so nothing states '
+                        'what this type is', S_WRAP),
+                       ('assign a proper PredefinedType, or name the type in '
+                        'ElementType', S_WRAP)])
+    if len(s7) > 1:
+        sheets.append(('Classification', s7, 1))
 
     # ---- Interferences ----
     if opt.clash and any(r['n_interferences'] for r in res):
@@ -2319,12 +3189,18 @@ def excel_report(path, res, opt):
 
     # ---- Floating ----
     if any(r['n_floating'] for r in res):
-        s6 = [_hdr('Model', 'Element', 'IFC class', 'Type / family',
-                   'Distance in plan (m)', 'Distance vertical (m)', 'Why flagged')]
+        s6 = [_hdr('Model', 'Severity', 'Element', 'IFC class', 'Type / family',
+                   'Distance in plan (m)', 'Distance vertical (m)',
+                   'Clear of the rest (m)', 'x spread of the rest',
+                   'Why flagged', 'Verdict')]
         for r in res:
             for fl in r['floating']:
-                s6.append([lab[r['file']], '#%d' % fl['id'], ifc_name(fl['class']),
-                           fl['type'], fl['plan_m'], fl['vert_m'], fl['reason']])
+                s6.append([lab[r['file']],
+                           (SEV_WORD[fl['grade']], SEV_STYLE[fl['grade']]),
+                           '#%d' % fl['id'], ifc_name(fl['class']),
+                           fl['type'], fl['plan_m'], fl['vert_m'],
+                           fl['clear_m'], fl['spread_ratio'], fl['reason'],
+                           (fl['verdict'], S_WRAP)])
         sheets.append(('Floating', s6, 1))
 
     write_xlsx(path, sheets)
@@ -2350,6 +3226,10 @@ def main():
     ap.add_argument('--float-k', type=float, default=8.0,
                     help='float sensitivity: flag beyond median + K x MAD of the '
                          'distance from centre; lower is stricter (default 8)')
+    ap.add_argument('--float-detach', type=float, default=4.0,
+                    help='a flagged element displaced by more than this many '
+                         'times the spread of the rest is graded FIX rather '
+                         'than REVIEW (default 4)')
     ap.add_argument('--float-min', type=float, default=10.0,
                     help='floor for the derived float thresholds, metres (default 10)')
     ap.add_argument('--dup-tol', type=float, default=10.0,
@@ -2367,9 +3247,19 @@ def main():
     ap.add_argument('--min-geometry', type=float, default=0.90,
                     help='flag a model whose resolved-geometry share falls below '
                          'this fraction (default 0.90)')
+    ap.add_argument('--min-classified', type=float, default=0.90,
+                    help='flag a model whose share of elements with a specific '
+                         'PredefinedType falls below this fraction (default 0.90)')
+    ap.add_argument('--expect-schema', metavar='SCHEMA',
+                    help='require every model to be on this schema, e.g. IFC4X3; '
+                         'without it the majority schema in the package is used')
+    ap.add_argument('--expect-view', metavar='NAME',
+                    help='require every model to declare this ViewDefinition, '
+                         'e.g. ReferenceView_V1.2')
     ap.add_argument('--max-rows', type=int, default=20,
                     help='max rows printed per section per model (default 20)')
     opt = ap.parse_args()
+    opt.skipped = []
 
     files = []
     for p in opt.paths:
@@ -2387,9 +3277,19 @@ def main():
         sys.exit(1)
 
     res = []
+    opt.skipped = []
     for f in files:
         sys.stderr.write('reading %s ...\n' % os.path.basename(f))
-        res.append(audit_file(f, opt))
+        try:
+            res.append(audit_file(f, opt))
+        except (IOError, OSError) as e:
+            opt.skipped.append((os.path.basename(f), str(e)))
+            sys.stderr.write('  SKIPPED: %s\n' % e)
+    if not res:
+        print('No .ifc file could be read.')
+        for name, why in opt.skipped:
+            print('  %s: %s' % (name, why))
+        sys.exit(1)
     report(res, opt)
 
     if opt.json:

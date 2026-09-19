@@ -15,6 +15,151 @@ Instructions
 	4. Command "python ifc_audit.py"
 
 --------------------------------------------------------------------------
+v3 - 19 September 2026
+--------------------------------------------------------------------------
+What changed
+	The report now reads the file header, which nothing else does. The
+	ViewDefinition written there is the MVD the export claims to follow, and
+	it is checked against the schema the file was actually written as.
+
+	A mismatch means anything reading the header is told the wrong MVD. It
+	does NOT mean the wrong export setup was used.
+
+	Revit writes the ViewDefinition by schema, not by the view setup chosen.
+	Across a nine-model package from two exporter builds, all eight
+	IFC4X3_ADD2 files said "CoordinationView" and the one IFC2X3 file said
+	"CoordinationView_V2.0" - and one of those eight came from an IFC4x3
+	Reference View [BuildingService] setup. The string records the schema,
+	which FILE_SCHEMA already states, and says nothing about the MVD.
+
+	So that combination is reported as [ok] with a note, not as a finding:
+	eight identical warnings no author can act on would only bury the real
+	ones. It is still not an IFC4 MVD name - buildingSMART replaced the
+	Coordination View with the Reference View and the Design Transfer View
+	at IFC4 - so the note says to read the export setup and to tell the
+	receiving side the intended MVD, because the header will not.
+
+	The check still fires for an exporter with no known artefact, where a
+	mismatched header is worth acting on.
+
+	Every geometric element is now checked for whether it says what it is:
+	an IfcClass that is not a generic proxy, and a PredefinedType that is
+	neither NOTDEFINED nor pushed to USERDEFINED. Elements exported as
+	IfcBuildingElementProxy are flagged on their own, because a proxy is an
+	element the exporter could not map at all.
+
+	Type objects are now read. v2 skipped them, which left the duplicate
+	checker's family-name fallback permanently empty - on the test model, 0
+	of 58 type references resolved. They also carry a PredefinedType that
+	the occurrence inherits, so an element saying NOTDEFINED whose type says
+	BEND is correctly counted as classified rather than flagged.
+
+Geometry the tool could not previously read
+	Two gaps made real elements look like they were floating, and both are
+	fixed.
+
+	IfcCompositeCurve and its segments were never parsed. Revit writes rolled
+	and formed steel sections - channels, angles - as a composite curve of
+	line and arc segments, so those profiles had no extent, the solids built
+	on them had no extent, and the elements fell back to their ObjectPlacement.
+	For Revit structural framing that placement is the storey origin, so every
+	affected beam collapsed onto the SAME point and the whole group was
+	reported as floating a fixed distance from the model centre. On the test
+	model that was 57 beams at an identical 167.5 m.
+
+	Deeply nested booleans hit the recursion guard. A floor slab with 41
+	penetrations is 41 nested IfcBooleanResult, and the guard stopped at 32
+	before reaching the solid. The first-operand chain is now walked
+	iteratively, so nesting depth no longer matters.
+
+	Together these took the structural test model from 79.3% to 100% of
+	elements resolved from real geometry, and the floating count from 59 to 2.
+
+	The reason neither was visible: an entity type the parser does not keep is
+	not in memory at all, so the reader returned "no extent" before reaching
+	the line that records an unreadable type. The model reported "79% resolved"
+	with an EMPTY unresolved list, which reads as "nothing to see" rather than
+	"a fifth of this model could not be read". Misses are now counted, and the
+	DIAGNOSTICS section names them.
+
+How a floating element is graded
+	The fence decides what is unusual; a scale-free ratio decides how much it
+	matters. "Far" means nothing on its own - it only means something next to
+	the size of the model it is far from.
+
+	  [!] detached   displaced by more than --float-detach times the spread
+	                 of every element the fence accepted. Something is wrong.
+	  [?] outlying   past the fence, but still within reach of the model. An
+	                 overhead crane, a rooftop plant item and a lightning
+	                 finial all read this way and are all correctly placed.
+
+	The yardstick is measured from the elements the fence did NOT flag, so a
+	cluster of strays cannot widen it until it hides inside it - the same
+	reason the fence itself uses MAD rather than a percentile envelope.
+
+	On the test package this is what separates two overhead cranes sitting
+	5.8 m above the pipework in a 12.6 m building, which are correct, from an
+	element 890 m from everything else, which is not.
+
+One schema per package
+	A federated set read against two schemas is not one model. Entity
+	classes, property sets and georeferencing all differ between IFC2x3 and
+	IFC4/IFC4x3, so the schema mix is reported first and everything it
+	causes defers to it.
+
+	The hard consequence is georeferencing. IfcMapConversion and
+	IfcProjectedCRS were introduced in IFC4. A model still on IFC2x3 has
+	nowhere to put either, so it can never reach LoGeoRef 50 no matter how
+	the exporter is configured - and the standard "fill in the
+	MapConversion" advice is advice its author cannot follow. That model is
+	now told to change schema first, and it no longer drags the rest of the
+	package down to its own LoGeoRef in the summary.
+
+	By default the majority schema in the package is taken as the target.
+	Name one explicitly with --expect-schema IFC4X3 to have every model
+	checked against it instead, whichever way the majority falls.
+
+	Three things that follow from a schema mix are deliberately NOT reported
+	as separate findings, because they are the same fault counted again:
+
+	  mixed ViewDefinitions   Revit writes the string by schema, so two
+	                          schemas always give two strings
+	  mixed CRS               the pre-IFC4 model cannot declare one
+	  package LoGeoRef 0      driven by the model that cannot be fixed
+	                          without changing its schema
+
+How classification is judged
+	Per element, worst first:
+
+	  [!]  IfcBuildingElementProxy, or any other generic catch-all class.
+	       The exporter could not map the family to an IFC class.
+	  [!]  PredefinedType USERDEFINED with no ObjectType and no ElementType.
+	       IFC requires one of them; without it nothing states what the
+	       element is, and the file breaks a schema rule.
+	  [!]  PredefinedType not written at all.
+	  [?]  A generic supertype - IfcFlowSegment where IfcPipeSegment was
+	       meant. One level short, common in older IFC2x3 exports.
+	  [?]  PredefinedType USERDEFINED, described only by the Revit family
+	       name. Legal, but "Family450.0001" means nothing to the receiving
+	       system.
+	  [?]  NOTDEFINED on both the element and its type.
+	  [ok] A specific PredefinedType, on the element or inherited from its
+	       type. Also classes that have no PredefinedType in IFC2x3 at all,
+	       which is the schema's doing, not the modeller's.
+
+	PredefinedType is not always the last attribute. IfcDoor ends with its
+	OperationType and IfcStairFlight carries four extra attributes ahead of
+	PredefinedType, so the position is read from a per-class table; classes
+	not in that table are read by shape and marked "scan" in the Read by
+	column of the Classification sheet, so an assumption is never presented
+	as a reading.
+
+	Type objects are checked separately for the USERDEFINED / ElementType
+	rule and reported under Schema rule. That one is a real schema
+	violation: a strict importer may reject the file rather than read it
+	loosely.
+
+--------------------------------------------------------------------------
 v2 - 5 September 2026
 --------------------------------------------------------------------------
 What changed
@@ -135,8 +280,13 @@ Sharing the results
 
 	  Summary                Result block: FIX / REVIEW / PASS per check,
 	                         colour coded, with the package name and run date
-	  Models                 one row per model - schema, units, element and
-	                         geometry counts, CRS, centres, MapConversion
+	  Models                 one row per model - schema, view definition and
+	                         MVD check, exporting tool, units, element and
+	                         geometry counts, classified share, CRS,
+	                         centres, MapConversion
+	  Classification         every element flagged on IfcClass or
+	                         PredefinedType, with what to do about it, plus
+	                         the type objects breaking the USERDEFINED rule
 	  Georeferencing         LoGeoRef level, anchor coordinates, the offset
 	                         of each model from the package median, and the
 	                         HOW TO FIX text
@@ -159,7 +309,15 @@ Options (all optional - "python ifc_audit.py" alone still works)
 	--dup-tol 10           coincidence tolerance in millimetres
 	--geo-tol 1            MapConversion agreement tolerance in millimetres
 	--min-geometry 0.90    flag a model resolving less geometry than this
+	--min-classified 0.90  flag a model classifying less than this share
+	--expect-schema S      require every model to be on schema S, e.g.
+	                       IFC4X3; default is the package majority
+	--expect-view NAME     require every model to declare this
+	                       ViewDefinition, e.g. ReferenceView_V1.2
 	--float-k 8            floating sensitivity; lower is stricter
+	--float-detach 4       past the fence, how many times the spread of the
+	                       rest counts as detached (FIX) rather than
+	                       outlying (REVIEW)
 	--float-min 10         floor for the derived float limits, metres
 	--float-xy M           override the plan float limit with M metres
 	--float-z M            override the vertical float limit with M metres
