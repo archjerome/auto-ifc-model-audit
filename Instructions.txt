@@ -1,5 +1,6 @@
 18 June 2026
-Audits IFC models for Geolocation, duplicate elements, out of bounds objects
+Audits IFC models for Geolocation, spatial structure, duplicate elements,
+out of bounds objects
 Make sure you have Python 3 installed:
 	winget install Python.Python.3
 		py --version
@@ -13,6 +14,324 @@ Instructions
 	2. Open Windows Powershell
 	3. Change the current directory to the abovementioned folder cd "your_folder"
 	4. Command "python ifc_audit.py"
+
+--------------------------------------------------------------------------
+v4 - rule ids, profiles and spatial structure
+     (roadmap; Phases 1 and 2 landed 20 Oct 2026)
+--------------------------------------------------------------------------
+Why this direction
+	Up to v3 this tool was a narrator. It found a problem and explained in
+	prose why it mattered, which is the part a rule table does badly. What
+	it could not do was be cited. "The audit flagged your georeferencing"
+	is not something a design team can file, argue with, or close out. A
+	finding with an identifier is.
+
+	The second thing it could not do was travel. The tool is run on
+	projects in several countries, and every one of them is checked
+	against something different - a national e-submission regime, a client
+	EIR, a BEP, a joint-venture modelling standard. Each names its own
+	schema, its own MVD, its own thresholds, its own list of acceptance
+	criteria, and its own words for pass and fail.
+
+	Build any one of those into the tool and it is correct for one project
+	and wrong for the rest. So the split is:
+
+	  the rules        what the tool can actually examine. Universal, and
+	                   in the source.
+	  the profile      what THIS project is being held to. Regional, and
+	                   in a JSON file beside the project.
+
+	So the direction is: keep the prose, add the identity, and keep every
+	region-specific expectation out of the source.
+
+Phase 1 - rule identity and profiles                     (landed)
+	No new parsing, so no cost to a normal run. See "What landed in
+	Phase 1" below.
+
+Phase 2 - spatial structure                              (landed)
+	IfcBuildingStorey, IfcSpace, IfcRelContainedInSpatialStructure and both
+	sides of IfcRelAggregates are now parsed. Five new rules, S01 to S05.
+	See "What landed in Phase 2" below.
+
+	This was the single biggest gap in the tool and nothing about it is
+	regional - every federated package in every country needs its elements
+	on a storey, its storeys agreeing between the disciplines, and its tree
+	rooted at the IfcProject.
+
+Phase 3 - BCF export                                     (next)
+	Scheduled before the property work because it is small and because it
+	changes who can act on the report. A finding in a text file has to be
+	found again by hand in the authoring tool; a finding in BCF opens next
+	to the element that caused it.
+
+	Every finding already carries element ids and bounding boxes, so the
+	viewpoint geometry is in hand, and BCF 2.1 is a zip of markup.bcf and
+	viewpoint.bcfv per topic - the same zipfile machinery the .xlsx writer
+	already uses, so the no-install promise survives.
+
+Phase 4 - property sets and required-information schedules  (the large one)
+	Parse IfcPropertySet, IfcRelDefinesByProperties and
+	IfcPropertySingleValue, filtered to the property names the active
+	profile actually asks for, so a run without a profile pays nothing.
+
+	Then check each element against a schedule of required properties.
+	This is the check every client and every authority wants and no two
+	of them define the same way, so the schedule is profile data - a
+	versioned file naming entity, property set, property and permitted
+	values - and never a table in the source. The same mechanism serves a
+	national submission requirement, a client EIR and an in-house BEP
+	without the tool knowing the difference between them.
+
+	Whichever schedule is in use, record its edition in the report. A
+	requirements list is revised; a tool that checks against last year's
+	revision and says nothing about which one it used is worse than one
+	that does not check at all.
+
+Phase 5 - the two that need new geometry
+	Floor-area coverage by IfcSpace - how much of a storey is actually
+	tagged as rooms - is a 2D polygon union against the storey outline,
+	not a bounding box question. Doable in the standard library, but it is
+	a new geometry capability rather than an extension of the existing
+	axis-aligned box code.
+
+	Hard clash detection at a millimetre tolerance is not reachable with
+	axis-aligned boxes at all. On MEP it would report thousands of pairs
+	that do not touch. Real solid-to-solid intersection needs a geometry
+	kernel, and that ends the no-dependency design that is the reason this
+	tool can be handed to someone with nothing but Python installed.
+
+	The intent is therefore to tighten the interference pass with a
+	structural-element filter and a footprint test, and to keep saying
+	plainly in the report that it is a smell test rather than clash
+	detection. A profile that lists clash detection as one of its checks
+	will show it as "partial" for exactly that reason.
+
+What this tool is not
+	It is a pre-check. Where a project is checked by someone else - an
+	authority, a client, an independent reviewer - their result is the one
+	that counts, and this tool has no access to whatever they run. What it
+	is for is the round that happens before that: find the problems while
+	they are still cheap to fix, with an explanation of each one attached.
+
+	This is why the profile prints the gaps. A profile lists the checklist
+	it is answering, including the items no rule examines yet, so the
+	report states which of the asks this run did not look at. A check that
+	did not run must not read as a check that passed - the same reason v3
+	started counting the elements left out of the duplicate pass.
+
+What landed in Phase 2
+	The spatial tree is read: IfcBuildingStorey, IfcSpace,
+	IfcRelContainedInSpatialStructure, and the child side of
+	IfcRelAggregates, which Phase 1 never kept. Five new rules:
+
+	  S01  Spatial hierarchy rooted
+	  S02  Building storeys present
+	  S03  Storey agreement across models
+	  S04  Elements assigned to a storey
+	  S05  Rooms modelled as IfcSpace
+
+	A new SPATIAL STRUCTURE section in the report, a Spatial structure tab
+	in the workbook, and an Elements off storey tab when there is anything
+	to put on it.
+
+Storeys are compared in the survey datum, not in project coordinates
+	This is the part that decides whether the check is worth anything.
+
+	Three numbers are kept per storey and only one of them compares
+	between models:
+
+	  the Elevation attribute   relative to whatever datum the authoring
+	                            model used. Not comparable.
+	  project Z                 the placement chain resolved. Comparable
+	                            only while every model shares project
+	                            coordinates.
+	  the level                 project Z plus the height the model carries
+	                            in IfcMapConversion. This is the storey in
+	                            the survey datum, and it is what the
+	                            package is held against.
+
+	A Revit export made on shared coordinates puts the survey offset in
+	the IfcSite placement and leaves IfcMapConversion at zero. One made on
+	the survey point puts it in IfcMapConversion and leaves the placement
+	at zero. Both are correct and both land on the same real-world level -
+	but their raw project Z differs by the whole offset. On the test
+	package that is 647 m, so comparing project Z reported every storey of
+	a correctly-built package as a disagreement. Reading the level in the
+	survey datum reports none, which is the right answer.
+
+How a storey disagreement is graded
+	Two different faults, because they have different fixes.
+
+	  [?] one level, several names
+	      Nothing geometric is wrong, but anything that groups the package
+	      by storey - a federated viewer, a 4D sequence, a BCF issue list -
+	      sees two levels where there is one. On the test package the
+	      interiors model calls a level "L0 TOC" where the structural model
+	      calls it "KD03-L0".
+
+	  [!] one name, several levels
+	      The models disagree about where a named level is, so one of them
+	      stacks wrong - and nothing in either model looks wrong on its
+	      own.
+
+	The second is graded on how far apart they are. A structural model
+	carries top of concrete where the architectural model carries finished
+	floor level, so a slab-thickness offset under one name is a datum
+	difference to confirm rather than a mistake to fix. Within
+	--storey-datum it is reported [?] and named as that; past it, [!].
+	On the test package every structural level sits exactly 100 mm below
+	the architectural one of the same name, which is a datum, not a fault.
+
+	One case is deliberately NOT reported as a storey fault. If taking out
+	the difference between each model's own survey height makes the
+	disagreement vanish, the storeys agree and the models are hung at
+	different heights - which is G05, already reported. Naming it again
+	here would send the author to move storeys that are correct, so it is
+	graded [?] and pointed back at the anchor finding.
+
+	Storeys within --storey-tol of each other are read as one level of the
+	package, which is how a 1 mm rounding difference between two exports
+	does not read as two levels.
+
+How containment is judged
+	An element is on a storey if it is in an
+	IfcRelContainedInSpatialStructure, directly or through its decomposition.
+
+	The inheritance matters. The members of a curtain wall and the flights
+	of a stair appear in no containment relation of their own - their
+	assembly does, and they belong to whatever contains it. Reading only
+	the direct relation would report every one of those parts as loose in
+	the file.
+
+	  [!] in no spatial structure at all
+	      The element belongs to no storey, so it shows under no level in a
+	      receiving system and is skipped by anything that walks the model
+	      by storey.
+	  [?] held by the site, the building or another container rather than
+	      by a storey
+	      Correct for external works and for anything spanning the whole
+	      building, worth confirming for the rest.
+
+	An element contained in an IfcSpace counts as being on that space's
+	storey.
+
+Storeys and spaces that are missing rather than wrong
+	S02 and S05 are graded on the package, not on each model, because a
+	structural or piping model with no rooms in it is right and eight
+	findings saying so would bury the one that matters.
+
+	  S02  a model with no IfcBuildingStorey while the rest of the package
+	       has them is [?]: its content cannot be federated by level
+	       alongside the others. No storeys anywhere in the package is also
+	       [?] - expected of an infrastructure package, where there are no
+	       storeys to model, and a gap in a building one.
+	  S05  no IfcSpace anywhere in the package is [?]: nothing in it can be
+	       checked, scheduled or counted by room. A space that sits on no
+	       storey is reported separately, because it is not counted in that
+	       storey's area.
+
+What S01 actually walks
+	IfcProject at the apex with nothing above it, IfcSite aggregated into
+	it, IfcBuilding into a site, IfcBuildingStorey into a building, and
+	IfcSpace into a storey, a building or a site - a plant yard has no
+	storey to sit on. Anything hanging off nothing is named, with what it
+	is called, so it can be found in the authoring model.
+
+What landed in Phase 1
+	Every finding now carries a rule id.
+
+	  F01  File readable
+	  F02  Schema version
+	  F03  Schema addenda consistency
+	  F04  Length units consistent
+	  F05  View definition / MVD
+	  F06  IfcProject present                             new
+	  F07  IfcSite present                                new
+	  F08  One IfcSite per model                          new
+	  G01  Projected CRS declared
+	  G02  Level of georeferencing
+	  G03  MapConversion agreement
+	  G04  MapConversion scale
+	  G05  Site anchor agreement
+	  D01  GlobalId uniqueness
+	  D02  Duplicate elements
+	  D03  Probable duplicates
+	  C01  Generic proxies
+	  C02  Classification completeness
+	  C03  Type object PredefinedType rule
+	  X01  Geometry coverage
+	  X02  Floating elements
+	  X03  Interferences
+
+	The ids are printed in the RESULT block, written to the Excel Summary
+	sheet and carried in the JSON, so a finding can be referred to by
+	name in an email, a BEP, or a comment back from the design team.
+
+	The --json file changed shape to carry them. v3 wrote a bare list of
+	models; v4 writes an object - {tool, generated, profile, rules,
+	findings, models} - with v3's list under "models". A list had nowhere
+	to put the findings, and findings outside the file are what the rule
+	ids exist for. Anything reading the old file wants ["models"] now.
+
+	F06 and F07 are presence checks only, and stay that way: proving
+	IfcProject is the apex with IfcSite below it needs the relationship
+	entities, which Phase 2 added as S01. The two are kept apart because a
+	model can hold both entities and still have them hanging off nothing.
+
+	--rules
+		Prints the rule table and exits. No model needed. This is the
+		list to map a profile against.
+
+	--profile FILE.json
+		States what this project is being held to. Everything in it is
+		optional.
+
+		  name, version, description
+		      printed at the head of the coverage section, so a report
+		      says which revision of which requirement it was run
+		      against.
+
+		  options
+		      the long form of any command-line option, underscored:
+		      expect_schema, expect_view, clash, min_classified,
+		      geo_tol, dup_tol, float_k and so on. Anything you pass on
+		      the command line yourself always wins, so
+		      --profile x.json --expect-schema IFC4X3 checks against
+		      IFC4x3 whatever the file says.
+
+		      A profile can set what to check for. It cannot set where
+		      output goes or which files are read.
+
+		  severity_words
+		      what to call the three grades. The grades themselves never
+		      change; only the words do, so a report can be read beside
+		      a checker that says FAIL / ALERT / PASS instead of
+		      FIX / REVIEW / PASS.
+
+		  checks
+		      the external checklist the profile answers, each item
+		      mapped onto the rule ids that address it:
+
+		        {"id": "A-01", "title": "Models are IFC4 Reference View",
+		         "rules": ["F02", "F05"], "cover": "partial",
+		         "note": "the MVD is read from the file header"}
+
+		      This drives the PROFILE COVERAGE section, which lists
+		      every item with the rules behind it and the grade each one
+		      reached - and lists the items with NO rules behind them
+		      just the same, marked "not yet". Listing those is the
+		      point of the section rather than an omission.
+
+		      A check with no rules is always "not yet", whatever the
+		      file claims. A profile may not assert coverage it has no
+		      rule for; saying which asks went unexamined stays the
+		      tool's statement to make, not the file's.
+
+	profiles/example.json is a worked example of the whole format.
+
+	Keep real profiles with the project rather than in this repository.
+	They are project data, they are revised on the project's schedule,
+	and the next project will need a different one.
 
 --------------------------------------------------------------------------
 v3 - 19 September 2026
@@ -298,6 +617,15 @@ Sharing the results
 	  Classification         every element flagged on IfcClass or
 	                         PredefinedType, with what to do about it, plus
 	                         the type objects breaking the USERDEFINED rule
+	  Spatial structure      one row per storey per model - the Elevation
+	                         attribute, project Z, the level in the survey
+	                         datum, the level of the package it fell into,
+	                         whether it agrees with the other models and why,
+	                         what else the same level is called, and the
+	                         elements and spaces on it
+	  Elements off storey    every element in no spatial structure, and every
+	                         one held by the site or the building rather than
+	                         by a storey
 	  Georeferencing         LoGeoRef level, anchor coordinates, the offset
 	                         of each model from the package median, and the
 	                         HOW TO FIX text
@@ -311,14 +639,27 @@ Sharing the results
 	two interference sheets.
 
 Options (all optional - "python ifc_audit.py" alone still works)
+	--profile FILE.json    apply a submission profile - see v4
+	--rules                print the rule table and exit; no model needed
 	--excel audit.xlsx     write the shareable Excel workbook
-	--json report.json     also write every finding to a JSON file
+	--json report.json     also write every finding to a JSON file.  From
+	                       v4 the file is an object, not the bare list v3
+	                       wrote: {tool, generated, profile, rules,
+	                       findings, models}, with v3's list under
+	                       "models".  A list had nowhere to put the rule
+	                       ids, which is the whole point of carrying them.
 	--clash                add the interference report (off by default)
 	--clash-frac 0.30      overlap share of the smaller element to report
 	--dup-iou 0.90         box overlap at or above which a pair is DUPLICATE
 	--probable-iou 0.50    box overlap at or above which a pair is PROBABLE
 	--dup-tol 10           coincidence tolerance in millimetres
 	--geo-tol 1            MapConversion agreement tolerance in millimetres
+	--storey-tol 50        storeys within this many mm of each other are read
+	                       as one level of the package
+	--storey-datum 600     a storey name found at two levels further apart
+	                       than --storey-tol but within this is reported as a
+	                       datum difference to confirm - finished floor level
+	                       against top of concrete - rather than as a fault
 	--min-geometry 0.90    flag a model resolving less geometry than this
 	--min-classified 0.90  flag a model classifying less than this share
 	--expect-schema S      require every model to be on schema S, e.g.
@@ -344,4 +685,4 @@ Notes
 	INTERFERENCES is a bounding-box smell test, not clash detection. On MEP
 	models it reports pipes overlapping their own fittings at connections.
 
-	ifc_audit_v1_backup.py is the previous version, kept for comparison.
+	ifc_audit_v3_backup.py is the previous version, kept for comparison.

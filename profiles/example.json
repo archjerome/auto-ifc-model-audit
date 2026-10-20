@@ -1,0 +1,99 @@
+{
+  "name": "Example submission profile",
+  "version": "2026-10",
+  "description": "A worked example of the profile format. Copy it, put your own project's expectations in options, and map whatever checklist you are answering - a regulator's codes, a client EIR, a BEP acceptance criteria - onto the rule ids in checks. Run `python ifc_audit.py --rules` to see the ids.",
+
+  "options": {
+    "expect_schema": "IFC4",
+    "expect_view": "ReferenceView",
+    "clash": true,
+    "min_geometry": 0.90,
+    "min_classified": 0.90,
+    "geo_tol": 1.0,
+    "storey_tol": 50.0,
+    "storey_datum": 600.0
+  },
+
+  "severity_words": {
+    "!": "FAIL",
+    "?": "ALERT",
+    "ok": "PASS"
+  },
+
+  "checks": [
+    {
+      "id": "EX-01",
+      "title": "Every model opens",
+      "rules": ["F01"],
+      "cover": "covered"
+    },
+    {
+      "id": "EX-02",
+      "title": "One schema and one MVD across the set",
+      "rules": ["F02", "F03", "F05"],
+      "cover": "partial",
+      "note": "the MVD is read from the file header, which some exporters write from the schema rather than from the view setup chosen - check the export setup itself before acting on it"
+    },
+    {
+      "id": "EX-03",
+      "title": "Spatial hierarchy is rooted",
+      "rules": ["F06", "F07", "F08", "S01"],
+      "cover": "covered",
+      "note": "IfcProject at the apex, IfcSite below it, and every building, storey and space aggregated into the one above it"
+    },
+    {
+      "id": "EX-03b",
+      "title": "Every element is on a storey",
+      "rules": ["S02", "S04"],
+      "cover": "covered",
+      "note": "containment is inherited down a decomposition, so the parts of an assembly count as contained by whatever holds the assembly"
+    },
+    {
+      "id": "EX-04",
+      "title": "Models share one survey point",
+      "rules": ["G01", "G02", "G03", "G04", "G05"],
+      "cover": "covered",
+      "note": "compares the resolved real-world anchor, not only the declared IfcMapConversion values"
+    },
+    {
+      "id": "EX-05",
+      "title": "No duplicated or stray elements",
+      "rules": ["D01", "D02", "D03", "X02"],
+      "cover": "covered"
+    },
+    {
+      "id": "EX-06",
+      "title": "Elements say what they are",
+      "rules": ["C01", "C02", "C03"],
+      "cover": "partial",
+      "note": "IfcClass and PredefinedType only; required property sets are not read yet"
+    },
+    {
+      "id": "EX-07",
+      "title": "No hard clashes between disciplines",
+      "rules": ["X03"],
+      "cover": "partial",
+      "note": "bounding-box overlap, not a solid intersection - a smell test, so do not report it as clash detection"
+    },
+    {
+      "id": "EX-08",
+      "title": "Storey names and levels agree across models",
+      "rules": ["S03"],
+      "cover": "covered",
+      "note": "levels are compared in the survey datum, so a model carrying the offset in its IfcSite placement is comparable with one carrying it in IfcMapConversion. A same-named level differing by less than storey_datum is reported as a datum difference to confirm - finished floor level against top of concrete - rather than as a fault."
+    },
+    {
+      "id": "EX-09",
+      "title": "Rooms are modelled as spaces",
+      "rules": ["S05"],
+      "cover": "partial",
+      "note": "IfcSpace presence and which storey each space sits on. How much of each storey floor area is covered by spaces is a 2D polygon union and is not checked yet."
+    },
+    {
+      "id": "EX-10",
+      "title": "Required property sets on every element",
+      "rules": [],
+      "note": "nothing checks this yet - IfcPropertySet is not parsed. Listed so the gap is visible in the report instead of being silently absent."
+    }
+  ]
+}

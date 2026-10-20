@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
 """
-ifc_audit.py - openBIM / IFC model-package review tool.  (v3)
+ifc_audit.py - openBIM / IFC model-package review tool.  (v4)
+
+Every finding carries a stable rule id (F01, G05, X02 ...) so it can be cited
+in an email, a BEP or a comment back from the design team; --rules prints the
+table.
+
+What a given project, client or authority asks for is not built in - this tool
+is run on projects in several countries, and any one region's requirements
+baked in here would be wrong for all the others.  --profile FILE.json states
+them as project data: the schema and MVD to expect, the thresholds, the words
+to grade in, and an external checklist mapped onto the rule ids.  The report
+then names every item on that checklist no rule examined, because a check that
+did not run must not read as a check that passed.
 
 Checks a folder (or list) of .ifc files for:
+  * Spatial structure: IfcProject at the apex with IfcSite, IfcBuilding,
+    IfcBuildingStorey and IfcSpace each aggregated into the one above it;
+    every element contained in a storey, counting the containment an
+    assembly's parts inherit from the assembly; and whether the storeys of
+    the package agree on name and level across the discipline models.
+    Levels are read in the survey datum rather than in project coordinates,
+    because a model that carries the survey offset in its IfcSite placement
+    and one that carries it in IfcMapConversion are both correct and land on
+    the same real-world level.
   * Export setup: the ViewDefinition (MVD) the authoring tool declared in the
     file header, checked against the schema actually written.  A Revit export
     left on 'IFC 2x3 Coordination View' while the schema target is IFC4 names
@@ -25,9 +46,10 @@ Checks a folder (or list) of .ifc files for:
   * Floating elements: physical elements anomalously far from the model,
     found with a median + MAD fence rather than a percentile envelope that
     stray clusters can widen until they hide inside it.
-  * Cross-file consistency: schema/unit mix, and - most importantly - whether
-    the models agree on their IfcMapConversion, which is what actually decides
-    whether a federated package lines up.  An all-zero IfcMapConversion is
+  * Cross-file consistency: schema/unit mix, whether the models agree on the
+    storeys they are built on, and - most importantly - whether they agree on
+    their IfcMapConversion, which is what actually decides whether a
+    federated package lines up.  An all-zero IfcMapConversion is
     called out as a placeholder rather than counted as agreement.
 
 Geometry
@@ -55,6 +77,8 @@ Usage:
   python ifc_audit.py <folder> --clash                   # add interference report
   python ifc_audit.py <folder> --float-k 4               # stricter float check
   python ifc_audit.py <folder> --float-z 20              # absolute float limit, m
+  python ifc_audit.py <folder> --profile project.json   # project expectations
+  python ifc_audit.py --rules                           # print the rule table
 """
 import re, sys, os, json, math, glob, argparse, datetime, time
 from collections import Counter, defaultdict
@@ -670,6 +694,49 @@ EXCLUDE = {'IFCSITE', 'IFCBUILDING', 'IFCBUILDINGSTOREY', 'IFCSPACE', 'IFCSPATIA
 # Representation identifiers that are not the solid body of the element
 NON_BODY = {'Axis', 'FootPrint', 'Profile', 'SurveyPoints', 'Lighting', 'Box', 'Annotation'}
 
+# The IFC4x3 spatial containers that take the place of IfcBuilding on
+# infrastructure.  Before IFC4x3 none of these exist; from IFC4x3 an element
+# can be contained in one, and a tool that did not read them would report
+# every element of a bridge model as loose in the file.
+FACILITY_TYPES = ('IFCFACILITY', 'IFCFACILITYPART', 'IFCBRIDGE', 'IFCROAD',
+                  'IFCRAILWAY', 'IFCMARINEFACILITY')
+
+# The spatial containers, read in their own pass.  IfcSite is handled beside
+# the georeferencing it carries; the rest are read only as structure.
+SPATIAL_TYPES = set(('IFCBUILDING', 'IFCBUILDINGSTOREY', 'IFCSPACE',
+                     'IFCSPATIALZONE', 'IFCEXTERNALSPATIALELEMENT')
+                    + FACILITY_TYPES)
+
+# What each spatial class may hang from.  Wider than the textbook chain on
+# purpose, because the alternatives are all legal and a false finding here
+# would send someone to rebuild a correct model:
+#
+#   a site under a site        a campus split into plots
+#   a building under a building  a complex aggregating its blocks
+#   a storey under a storey    CompositionType PARTIAL, a split level
+#   a building under a project IfcSite is optional in IFC4
+#   a space under a building, a site or a facility   a plant yard or an
+#                              external area has no storey to sit on
+SPATIAL_PARENT = {
+    'IFCSITE': ('IFCPROJECT', 'IFCSITE'),
+    'IFCBUILDING': ('IFCSITE', 'IFCBUILDING', 'IFCPROJECT') + FACILITY_TYPES,
+    'IFCBUILDINGSTOREY': ('IFCBUILDING', 'IFCBUILDINGSTOREY') + FACILITY_TYPES,
+    'IFCSPACE': (('IFCBUILDINGSTOREY', 'IFCBUILDING', 'IFCSITE', 'IFCSPACE',
+                  'IFCSPATIALZONE') + FACILITY_TYPES),
+    'IFCSPATIALZONE': (('IFCPROJECT', 'IFCSITE', 'IFCBUILDING',
+                        'IFCBUILDINGSTOREY', 'IFCSPATIALZONE') + FACILITY_TYPES),
+    'IFCEXTERNALSPATIALELEMENT': (('IFCPROJECT', 'IFCSITE', 'IFCBUILDING',
+                                   'IFCBUILDINGSTOREY') + FACILITY_TYPES),
+}
+for _t in FACILITY_TYPES:
+    SPATIAL_PARENT[_t] = ('IFCPROJECT', 'IFCSITE') + FACILITY_TYPES
+
+# IfcSpatialStructureElement puts CompositionType at attribute 8.  IfcSpatialZone
+# and IfcExternalSpatialElement descend from IfcSpatialElement instead and put
+# PredefinedType there, so reading one by position would record the other.
+COMPOSITION_AT_8 = set(('IFCSITE', 'IFCBUILDING', 'IFCBUILDINGSTOREY',
+                        'IFCSPACE') + FACILITY_TYPES)
+
 # Entities kept during the parse pass (everything else is skipped for speed)
 KEEP = {
     'IFCCARTESIANPOINT', 'IFCDIRECTION', 'IFCAXIS2PLACEMENT3D', 'IFCAXIS2PLACEMENT2D',
@@ -768,6 +835,7 @@ class Model:
         self.schema = '?'
         self.unit_name = None         # e.g. 'MILLIMETRE'
         self.to_mm = None             # project length unit -> millimetres
+        self.n_projects = 0           # IfcProject count; the apex of the hierarchy
         self.site = []                # [(lat, lon, elev, name)]
         self.site_place = []          # IfcSite ObjectPlacement ids
         self.has_address = True if False else False
@@ -785,6 +853,15 @@ class Model:
         self.inst_type = {}           # element id -> IfcTypeObject id
         self.decomposed = set()       # ids that aggregate/nest children
         self.n_containers = 0         # geometry-less aggregates, audited via children
+        self.project_ids = []         # IfcProject ids, in file order
+        self.site_ids = []            # IfcSite ids, in file order
+        self.spatial = {}             # id -> spatial record (site/building/storey/space)
+        self.building_ids = []
+        self.storey_ids = []
+        self.space_ids = []
+        self.agg_parent = {}          # child id -> parent, from IfcRelAggregates/Nests
+        self.contained = {}           # element id -> the spatial element holding it
+        self.n_contain_rels = 0       # IfcRelContainedInSpatialStructure count
         self.type_ids = []            # IfcTypeObject ids, in file order
         self.view_def = None          # ViewDefinition [...] from FILE_DESCRIPTION
         self.exchange_req = None      # ExchangeRequirement [...]
@@ -837,6 +914,8 @@ class Model:
                 if typ == 'IFCPROJECT':
                     rec = parse_record(line)
                     a = split_args(rec[2])
+                    self.n_projects += 1
+                    self.project_ids.append(rec[0])
                     proj_units = ref(arg(a, 8))
                     ctx_ids += reflist(arg(a, 7))
                     self._count_guid(sval(arg(a, 0)), rec[0], typ)
@@ -856,10 +935,29 @@ class Model:
                         num(arg(a, 11)),
                         sval(arg(a, 2)) or sval(arg(a, 7)) or ''))
                     self.site_place.append(ref(arg(a, 5)))
+                    self.site_ids.append(rec[0])
+                    self._read_spatial(typ, rec[0], a)
                     if sval(arg(a, 12)) or sval(arg(a, 13)):
                         self.has_address = True
                     self._count_guid(sval(arg(a, 0)), rec[0], typ)
                     continue
+                if typ in SPATIAL_TYPES:
+                    # The spatial tree: what decides which level an element is
+                    # on, and therefore whether a federated set stacks.  Held
+                    # apart from self.elements because none of these are
+                    # elements - they are the containers elements sit in.
+                    rec = parse_record(line)
+                    a = split_args(rec[2])
+                    self._read_spatial(typ, rec[0], a)
+                    self._count_guid(sval(arg(a, 0)), rec[0], typ)
+                    continue
+                if typ == 'IFCRELCONTAINEDINSPATIALSTRUCTURE':
+                    rec = parse_record(line)
+                    a = split_args(rec[2])
+                    st = ref(arg(a, 5))
+                    self.n_contain_rels += 1
+                    for e in reflist(arg(a, 4)):
+                        self.contained.setdefault(e, st)
                 if typ == 'IFCPOSTALADDRESS':
                     self.has_address = True
                     continue
@@ -878,12 +976,24 @@ class Model:
                         self.crs = sval(arg(self.ent[rec[0]][1], 0))
                     continue
 
-                if typ == 'IFCRELAGGREGATES':
+                if typ in ('IFCRELAGGREGATES', 'IFCRELNESTS'):
                     rec = parse_record(line)
                     a = split_args(rec[2])
                     parent = ref(arg(a, 4))
                     if parent is not None:
-                        self.decomposed.add(parent)
+                        if typ == 'IFCRELAGGREGATES':
+                            # IfcRelNests is deliberately left out of
+                            # self.decomposed: that set decides which
+                            # geometry-less entities are audited through their
+                            # parts instead, and a pipe with ports nested under
+                            # it is not an assembly of those ports.
+                            self.decomposed.add(parent)
+                        for kid in reflist(arg(a, 5)):
+                            # the child side, which Phase 1 never kept: it is
+                            # what lets the hierarchy be walked from a storey
+                            # up to the IfcProject, and what carries
+                            # containment down from an assembly to its parts
+                            self.agg_parent.setdefault(kid, parent)
 
                 # any remaining rooted entity: GlobalId uniqueness + elements.
                 # A rooted entity is 'IFCxxx(<22-char GlobalId>,<OwnerHistory|$>,...'
@@ -911,6 +1021,7 @@ class Model:
         self._resolve_units(proj_units)
         self._resolve_map_unit()
         self._resolve_context(ctx_ids)
+        self._resolve_spatial()
         self._build_elements(raw_elems)
         if self.site_place and self.site_place[0] is not None:
             self.site_origin = self.placement(self.site_place[0])[1]
@@ -984,6 +1095,46 @@ class Model:
     def _is_length_unit(self, uid):
         e = self.ent.get(uid)
         return bool(e) and e[0] in ('IFCSIUNIT', 'IFCCONVERSIONBASEDUNIT')             and '.LENGTHUNIT.' in arg(e[1], 1)
+
+    def _read_spatial(self, typ, eid, a):
+        """One spatial container: what it is called and where it sits.
+
+        Elevation is read only for IfcBuildingStorey - attribute 9 is the
+        storey elevation there and the site latitude on IfcSite, so reading it
+        by position on anything else would record a latitude as a level.
+        """
+        rec = {'id': eid, 'class': typ,
+               'name': sval(arg(a, 2)) or '',
+               'long_name': sval(arg(a, 7)) or '',
+               'composition': (enum_val(arg(a, 8))
+                               if typ in COMPOSITION_AT_8 else None),
+               'place_id': ref(arg(a, 5)),
+               'elevation': num(arg(a, 9)) if typ == 'IFCBUILDINGSTOREY' else None,
+               'z': None}
+        self.spatial[eid] = rec
+        if typ == 'IFCBUILDING':
+            self.building_ids.append(eid)
+        elif typ == 'IFCBUILDINGSTOREY':
+            self.storey_ids.append(eid)
+        elif typ == 'IFCSPACE':
+            self.space_ids.append(eid)
+
+    def _resolve_spatial(self):
+        """Where each container actually sits, through its placement chain.
+
+        The Elevation attribute is relative to whatever datum the authoring
+        model used, so it is not comparable between two discipline models.  The
+        placement chain resolves to absolute project coordinates, which is the
+        number two models can be held against each other on.
+        """
+        for rec in self.spatial.values():
+            pid = rec['place_id']
+            # only a real IfcLocalPlacement chain resolves; anything else
+            # would come back as the identity and read as a storey at zero,
+            # which is a level the file never stated
+            if pid is None or self.ent.get(pid, ('',))[0] != 'IFCLOCALPLACEMENT':
+                continue
+            rec['z'] = self.placement(pid)[1][2]
 
     def _count_guid(self, guid, eid, typ):
         """Tally a GlobalId and remember who used it, so counts and ids agree."""
@@ -1648,6 +1799,348 @@ def find_floating(elems, centres, u, opt):
 
 
 # ----------------------------------------------------------------------------
+# Spatial structure
+#
+# What decides whether a federated set stacks, and the one part of this tool
+# no regional profile changes: every package in every country needs its
+# elements on a storey, its storeys agreeing between the disciplines, and its
+# tree rooted at the IfcProject.  Phase 1 could only report that IfcProject
+# and IfcSite were present; with IfcRelAggregates now read from both sides the
+# chain between them is walked rather than assumed.
+# ----------------------------------------------------------------------------
+
+def spatial_name(rec):
+    """What to call a container in a report: its Name, else its LongName."""
+    return (rec.get('name') or rec.get('long_name') or
+            '(unnamed %s)' % ifc_name(rec.get('class', '?')))
+
+
+def _chain_up(parent_of, eid, stop=64):
+    """The parent chain above an id, nearest first, cycles cut."""
+    out = []
+    seen = set([eid])
+    cur = parent_of.get(eid)
+    while cur is not None and cur not in seen and len(out) < stop:
+        out.append(cur)
+        seen.add(cur)
+        cur = parent_of.get(cur)
+    return out
+
+
+def audit_hierarchy(m):
+    """Is the tree rooted the way IFC says it must be?
+
+    Presence was all Phase 1 could afford.  This is the structural question:
+    IfcProject at the apex with nothing above it, IfcSite aggregated into it,
+    IfcBuilding into a site, IfcBuildingStorey into a building.  A receiving
+    system walks that chain to decide what belongs to what, so a storey
+    hanging off nothing is invisible to it however well the storey itself is
+    filled in.
+    """
+    problems = []
+    if m.spatial and not m.agg_parent:
+        return {'ok': False, 'orphans': len(m.spatial),
+                'problems': ['no IfcRelAggregates in the file, so nothing '
+                             'states which site, building or storey anything '
+                             'belongs to']}
+
+    for pid in m.project_ids:
+        if pid in m.agg_parent:
+            up = m.agg_parent[pid]
+            problems.append('IfcProject is aggregated into %s, so it is not '
+                            'the apex of the hierarchy'
+                            % ifc_name((m.spatial.get(up) or {}).get('class', '?')))
+
+    orphans = 0
+    for rec in sorted(m.spatial.values(), key=lambda r: r['id']):
+        want = SPATIAL_PARENT.get(rec['class'], ())
+        pid = m.agg_parent.get(rec['id'])
+        if pid is None:
+            orphans += 1
+            if len(problems) < 40:
+                problems.append('%s %s is not aggregated into anything'
+                                % (ifc_name(rec['class']), spatial_name(rec)))
+            continue
+        got = ('IFCPROJECT' if pid in m.project_ids
+               else (m.spatial.get(pid) or {}).get('class', '?'))
+        if got not in want and len(problems) < 40:
+            problems.append('%s %s hangs off %s, not %s'
+                            % (ifc_name(rec['class']), spatial_name(rec),
+                               ifc_name(got),
+                               ' or '.join(ifc_name(w) for w in want)))
+    return {'ok': not problems, 'problems': problems[:40], 'orphans': orphans}
+
+
+def storey_of(m, eid):
+    """(container id, container class, storey id) for one element.
+
+    Containment is inherited down a decomposition: the members of a curtain
+    wall and the flights of a stair appear in no
+    IfcRelContainedInSpatialStructure of their own - their assembly does, and
+    they belong to whatever contains it.  Reading only the direct relation
+    would report every one of those parts as loose in the file.
+    """
+    cid = m.contained.get(eid)
+    if cid is None:
+        for up in _chain_up(m.agg_parent, eid):
+            if up in m.contained:
+                cid = m.contained[up]
+                break
+    if cid is None:
+        return None, None, None
+    rec = m.spatial.get(cid)
+    if rec is None:
+        # the relation names a container this parse did not keep
+        return cid, '?', None
+    if rec['class'] == 'IFCBUILDINGSTOREY':
+        return cid, rec['class'], cid
+    # an element contained in a space is on that space's storey
+    for up in _chain_up(m.agg_parent, cid):
+        r = m.spatial.get(up)
+        if r and r['class'] == 'IFCBUILDINGSTOREY':
+            return cid, rec['class'], up
+    return cid, rec['class'], None
+
+
+def audit_spatial(m, elems, u):
+    """The spatial structure of one model, and what hangs off it.
+
+    Three numbers are kept per storey, because they are three different
+    things and only one of them compares between models:
+
+      elevation_m  the Elevation attribute, relative to whatever datum the
+                   authoring model used - not comparable
+      z_m          the placement chain resolved to project coordinates -
+                   comparable only while every model shares them
+      level_m      z_m plus the height the model carries in IfcMapConversion,
+                   which is the storey in the survey datum
+
+    level_m is the one the package is held against.  A Revit export made on
+    shared coordinates puts the survey offset in the IfcSite placement and
+    leaves MapConversion at zero; one made on the survey point puts it in
+    MapConversion and leaves the placement at zero.  Both are correct and the
+    two land on the same real-world level - but their raw project Z differs by
+    the whole offset, so comparing z_m would report every storey of a
+    correctly-built package as a disagreement.
+    """
+    me = lambda v: None if v is None else round(v * u / 1000.0, 4)
+    mc = m.map_conv or {}
+    # map unit -> metres, so the MapConversion height reads in metres whatever
+    # unit the CRS is declared in
+    datum_h = (mc.get('height') or 0.0) * (m.map_to_mm or 1000.0) / 1000.0
+
+    storeys = []
+    for sid in m.storey_ids:
+        rec = m.spatial[sid]
+        z = me(rec['z'])
+        storeys.append({'id': sid, 'name': spatial_name(rec),
+                        'long_name': rec['long_name'],
+                        'elevation_m': me(rec['elevation']),
+                        'z_m': z,
+                        'level_m': None if z is None else round(z + datum_h, 4),
+                        'composition': rec['composition'],
+                        'n_elements': 0, 'n_spaces': 0})
+    by_id = dict((s['id'], s) for s in storeys)
+    storeys.sort(key=lambda s: (s['z_m'] is None,
+                                s['z_m'] if s['z_m'] is not None else 0.0))
+
+    # -- spaces: which storey each room is on -------------------------------
+    loose_spaces = []
+    for sp in m.space_ids:
+        host = None
+        for up in _chain_up(m.agg_parent, sp):
+            r = m.spatial.get(up)
+            if r and r['class'] == 'IFCBUILDINGSTOREY':
+                host = up
+                break
+        if host in by_id:
+            by_id[host]['n_spaces'] += 1
+        else:
+            loose_spaces.append(spatial_name(m.spatial[sp]))
+
+    # -- every element: which container holds it ----------------------------
+    counts = Counter()
+    loose = []
+    above = []
+    for e in elems:
+        cid, ccls, sid = storey_of(m, e.id)
+        if sid is not None:
+            counts['storey'] += 1
+            if sid in by_id:
+                by_id[sid]['n_elements'] += 1
+            continue
+        if cid is None:
+            counts['loose'] += 1
+            if len(loose) < 2000:
+                loose.append({'id': e.id, 'class': e.ifc_class,
+                              'type': e.type_key(m), 'container': '(none)'})
+            continue
+        counts['above'] += 1
+        rec = m.spatial.get(cid)
+        if len(above) < 2000:
+            if rec:
+                held_by = '%s %s' % (ifc_name(rec['class']), spatial_name(rec))
+            else:
+                held_by = 'an entity this tool does not read'
+            above.append({'id': e.id, 'class': e.ifc_class,
+                          'type': e.type_key(m), 'container': held_by})
+
+    return {
+        'hierarchy': audit_hierarchy(m),
+        'n_buildings': len(m.building_ids),
+        'n_storeys': len(m.storey_ids),
+        'n_spaces': len(m.space_ids),
+        'n_contain_rels': m.n_contain_rels,
+        'datum_height_m': round(datum_h, 4),
+        'storeys': storeys,
+        'spaces_outside_storey': loose_spaces[:40],
+        'n_spaces_outside_storey': len(loose_spaces),
+        'n_in_storey': counts['storey'],
+        'n_above_storey': counts['above'],
+        'n_loose': counts['loose'],
+        'loose': loose,
+        'loose_by_class': Counter(r['class'] for r in loose).most_common(12),
+        'above_by_container': Counter(r['container'] for r in above).most_common(12),
+        'above_storey': above,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Storeys across the package
+#
+# The highest-value item in Phase 2, and the reason the tree is worth parsing
+# at all.  "L1" in one model and "01-FIRST FLOOR" in another at the same
+# finished floor level breaks stacking silently: nothing in either model looks
+# wrong on its own, and the fault only appears once the set is federated.
+# ----------------------------------------------------------------------------
+
+def norm_storey(name):
+    """The form two storey names are compared in: case and spacing only.
+
+    Deliberately shallow.  Equating 'L1' with '01-FIRST FLOOR' needs a naming
+    convention this tool has no way to know, and guessing one would silently
+    pass exactly the disagreement the check exists to find.
+    """
+    return re.sub(r'\s+', ' ', (name or '').strip()).upper()
+
+
+def level_groups(res, lab, tol_m):
+    """Every model's storeys, clustered by the level they sit at.
+
+    Clustering is single-link on the sorted levels: two storeys land in one
+    group when they are within the tolerance of each other, which is how the
+    1 mm rounding difference between two exports reads as one level.
+    """
+    rows = []
+    for r in res:
+        for s in (r.get('spatial') or {}).get('storeys') or ():
+            if s['level_m'] is not None:
+                rows.append((s['level_m'], lab[r['file']], s))
+    rows.sort(key=lambda t: t[0])
+
+    raw = []
+    for row in rows:
+        if raw and row[0] - raw[-1][-1][0] <= tol_m:
+            raw[-1].append(row)
+        else:
+            raw.append([row])
+
+    out = []
+    for g in raw:
+        names = []
+        for z, l, s in g:
+            key = norm_storey(s['name'])
+            for n in names:
+                if n['key'] == key:
+                    n['models'].append(l)
+                    n['rows'].append((l, s))
+                    break
+            else:
+                names.append({'key': key, 'name': s['name'], 'models': [l],
+                              'rows': [(l, s)]})
+        out.append({'z': median([z for z, _, _ in g]),
+                    'low': g[0][0], 'high': g[-1][0], 'names': names,
+                    'models': [l for _, l, _ in g]})
+    return out
+
+
+def storey_conflicts(groups, datum_m, tol_m=0.05, h_off=None):
+    """Where the models disagree about the storeys.
+
+    Two separate faults, because they have different fixes:
+
+      one level, several names   nothing geometric is wrong, but anything
+                                 grouping the package by storey - a viewer, a
+                                 4D sequence, a BCF issue list - sees two
+                                 levels where there is one
+      one name, several levels   the models disagree about where a named level
+                                 is, so one of them stacks wrong
+
+    The second is graded on how far apart they are.  A structural model
+    carries top of concrete where the architectural model carries finished
+    floor level, so a slab-thickness offset under one name is a datum
+    difference to confirm rather than a mistake to fix.  A difference past
+    that is not explainable that way.
+
+    h_off, when given, is each model's own survey height against the package
+    median - what G05 grades.  A storey difference that disappears once those
+    offsets are taken out is not a storey fault at all: the levels agree and
+    the models are hung at different heights, which G05 already reports.
+    Naming it twice would send the author to fix the storeys instead.
+    """
+    split = [g for g in groups if len(g['names']) > 1]
+    h_off = h_off or {}
+
+    where = defaultdict(list)
+    for g in groups:
+        for n in g['names']:
+            where[n['key']].append((g, n))
+    drift = []
+    for key, hits in where.items():
+        if len(hits) < 2:
+            continue
+        zs = [g['z'] for g, _ in hits]
+        spread = max(zs) - min(zs)
+        levelled = [s['level_m'] - h_off.get(l, 0.0)
+                    for _, n in hits for l, s in n['rows']]
+        drift.append({'name': hits[0][1]['name'], 'spread_m': spread,
+                      'datum': spread <= datum_m,
+                      'anchor': max(levelled) - min(levelled) <= tol_m,
+                      'at': sorted([(g['z'], ', '.join(n['models']))
+                                    for g, n in hits], key=lambda t: t[0])})
+    drift.sort(key=lambda d: -d['spread_m'])
+    return split, drift
+
+
+def _anchor_offsets(res, lab):
+    """Each model's own survey height against the package median, in metres.
+
+    Storey levels are read in the survey datum, so a model hung half a metre
+    high carries every one of its storeys half a metre high.  That is the
+    anchor finding (G05), not a storey finding, and these offsets are what
+    let the storey check say so instead of repeating it.
+    """
+    anc = [(lab[r['file']], georef_anchor(r)) for r in res
+           if r['site_origin_m'] or r['map_conversion']]
+    if not anc:
+        return {}
+    mid = median([a[2] for _, a in anc])
+    return dict((l, a[2] - mid) for l, a in anc)
+
+
+def level_words(g):
+    """'+4.200 m is "K20L-L1" in AR, ME and "01-LEVEL 1" in PI1'."""
+    return '%+.3f m is %s' % (g['z'], ' and '.join(
+        '"%s" in %s' % (n['name'], ', '.join(n['models'])) for n in g['names']))
+
+
+def drift_words(d):
+    """'"K20L-B1" sits at -7.300 m in AR and -6.800 m in ST'."""
+    return '"%s" sits at %s' % (d['name'], ' and '.join(
+        '%+.3f m in %s' % (z, who) for z, who in d['at']))
+
+
+# ----------------------------------------------------------------------------
 # Georeferencing
 # ----------------------------------------------------------------------------
 
@@ -1926,6 +2419,9 @@ def audit_file(path, opt):
     cls = classify_elements(m, elems)
     bad_types = audit_type_objects(m)
 
+    # -- spatial structure --------------------------------------------------
+    spatial = audit_spatial(m, elems, u)
+
     site = m.site[0] if m.site else (None, None, None, '')
     return {
         'file': m.name, 'schema': m.schema,
@@ -1934,13 +2430,14 @@ def audit_file(path, opt):
         'preprocessor': m.preprocessor, 'export_date': m.export_date,
         'view_status': list(view_status(m.view_def, m.schema, m.authoring_tool)),
         'classification': cls,
+        'spatial': spatial,
         'bad_type_objects': bad_types[:2000],
         'n_bad_type_objects': len(bad_types),
         'n_type_objects': len(m.type_ids),
         'length_unit': m.unit_name, 'unit_to_mm': m.to_mm, 'unit_assumed_mm': unit_assumed,
         'true_north_deg': m.true_north, 'wcs_offset': m.wcs_offset,
         'ref_lat': site[0], 'ref_long': site[1], 'ref_elev': site[2],
-        'n_sites': len(m.site),
+        'n_sites': len(m.site), 'n_projects': m.n_projects,
         'projected_crs': m.crs, 'map_conversion': m.map_conv,
         'map_unit': m.map_unit_name, 'map_unit_to_mm': m.map_to_mm,
         'grid_rotation_deg': grid_rotation(m.map_conv),
@@ -2048,7 +2545,10 @@ for _n in ('Wall', 'WallStandardCase', 'Slab', 'Beam', 'Column', 'Footing', 'Pil
            'CivilElement', 'GeographicElement', 'TransportElement',
            'SystemFurnitureElement', 'Furniture', 'CurtainWall',
            'BuildingElementProxyType', 'Pile', 'Footing', 'StairFlight',
-           'RampFlight', 'Wall', 'Roof', 'Ceiling'):
+           'RampFlight', 'Wall', 'Roof', 'Ceiling',
+           # the spatial containers, which findings now name as well
+           'Project', 'Site', 'Building', 'BuildingStorey', 'SpatialZone',
+           'Zone', 'SpatialStructureElement', 'SpatialElement'):
     IFC_NAMES['IFC' + _n.replace(' ', '').upper()] = 'Ifc' + _n.replace(' ', '')
 
 
@@ -2161,18 +2661,357 @@ def centre_spread(res):
 
 FIX, REVIEW, PASS = '!', '?', 'ok'
 
+# ----------------------------------------------------------------------------
+# Rule registry
+#
+# Every finding carries a stable id, so it can be cited - in an email, a BEP,
+# or a comment back from the design team.  "the audit flagged your
+# georeferencing" is not something a design team can file, argue with or close
+# out; G02 is.
+#
+# The rules are the tool.  What a particular client, authority or region asks
+# for is NOT: that lives in a profile file, because this tool is run on
+# projects in several countries and anything baked in here would be wrong for
+# most of them.  See load_profile.
+# ----------------------------------------------------------------------------
+
+RULES = (
+    # id    area               title
+    ('F01', 'Unreadable',      'File readable'),
+    ('F02', 'Schema',          'Schema version'),
+    ('F03', 'Schema',          'Schema addenda consistency'),
+    ('F04', 'Units',           'Length units consistent'),
+    ('F05', 'View definition', 'View definition / MVD'),
+    ('F06', 'IfcProject',      'IfcProject present'),
+    ('F07', 'IfcSite',         'IfcSite present'),
+    ('F08', 'IfcSite',         'One IfcSite per model'),
+    ('S01', 'Spatial tree',    'Spatial hierarchy rooted'),
+    ('S02', 'Storeys',         'Building storeys present'),
+    ('S03', 'Storeys',         'Storey agreement across models'),
+    ('S04', 'Containment',     'Elements assigned to a storey'),
+    ('S05', 'Spaces',          'Rooms modelled as IfcSpace'),
+    ('G01', 'CRS',             'Projected CRS declared'),
+    ('G02', 'Georeferencing',  'Level of georeferencing'),
+    ('G03', 'Georeferencing',  'MapConversion agreement'),
+    ('G04', 'Georeferencing',  'MapConversion scale'),
+    ('G05', 'Site anchor',     'Site anchor agreement'),
+    ('D01', 'GlobalIds',       'GlobalId uniqueness'),
+    ('D02', 'Duplicates',      'Duplicate elements'),
+    ('D03', 'Probable dups',   'Probable duplicates'),
+    ('C01', 'Proxies',         'Generic proxies'),
+    ('C02', 'Classification',  'Classification completeness'),
+    ('C03', 'Schema rule',     'Type object PredefinedType rule'),
+    ('X01', 'Geometry',        'Geometry coverage'),
+    ('X02', 'Floating',        'Floating elements'),
+    ('X03', 'Interferences',   'Interferences'),
+)
+RULE = dict((r[0], {'id': r[0], 'area': r[1], 'title': r[2]}) for r in RULES)
+
+
+# ----------------------------------------------------------------------------
+# Submission profiles
+#
+# A profile is a JSON file, not a table in this source.  Every jurisdiction,
+# client and BEP asks for a different schema, a different MVD and a different
+# set of named checks, and a tool used across several countries cannot carry
+# any one of them as its default without being wrong everywhere else.  A
+# profile is therefore project data: keep it beside the project, not here.
+#
+#   {
+#     "name":    "Acme Tower - stage 3 issue",
+#     "version": "2026-10",
+#     "options": {"expect_schema": "IFC4", "expect_view": "ReferenceView",
+#                 "clash": true},
+#     "severity_words": {"!": "FAIL", "?": "ALERT", "ok": "PASS"},
+#     "checks": [
+#       {"id": "A-01", "title": "Models are IFC4 Reference View",
+#        "rules": ["F02", "F05"], "cover": "partial",
+#        "note": "the declared MVD is read from the file header"}
+#     ]
+#   }
+#
+# "options" takes the long form of any command-line option, underscored.
+# "checks" is the external checklist the profile answers - a regulator's codes,
+# a client's EIR clauses, a BEP's acceptance criteria - mapped onto the rules
+# that address each one.  Listing a check with no rules behind it is the point
+# of the section rather than an omission: it is how the report says out loud
+# which of the asks this run did not examine.
+# ----------------------------------------------------------------------------
+
+# Options a profile may set.  A profile states what to check for; it does not
+# get to redirect where output goes or which files are read.
+PROFILE_OPTIONS = {
+    'expect_schema', 'expect_view', 'clash', 'clash_frac', 'dup_tol', 'dup_iou',
+    'probable_iou', 'geo_tol', 'min_geometry', 'min_classified', 'float_k',
+    'float_detach', 'float_min', 'float_xy', 'float_z', 'max_rows',
+    'storey_tol', 'storey_datum',
+}
+
+COVER_WORDS = ('covered', 'partial')
+
+
+def load_profile(path):
+    """Read a profile file, and check it says what it claims to say."""
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            prof = json.load(fh)
+    except ValueError as e:
+        raise ValueError('%s is not valid JSON: %s' % (path, e))
+    if not isinstance(prof, dict):
+        raise ValueError('%s must contain a JSON object' % path)
+
+    bad = sorted(set(prof.get('options') or {}) - PROFILE_OPTIONS)
+    if bad:
+        raise ValueError('%s sets %s, which a profile may not set; allowed: %s'
+                         % (path, ', '.join(bad), ', '.join(sorted(PROFILE_OPTIONS))))
+    words = prof.get('severity_words') or {}
+    if words and sorted(words) != sorted((FIX, REVIEW, PASS)):
+        raise ValueError('%s severity_words must name exactly these three: %s'
+                         % (path, ', '.join(repr(w) for w in (FIX, REVIEW, PASS))))
+
+    checks = []
+    for i, c in enumerate(prof.get('checks') or ()):
+        ids = tuple(c.get('rules') or ())
+        unknown = [r for r in ids if r not in RULE]
+        if unknown:
+            raise ValueError('%s check %s names unknown %s: %s'
+                             % (path, c.get('id', i), plural(len(unknown), 'rule'),
+                                ', '.join(unknown)))
+        # A profile may not claim coverage it has no rule for.  Saying which
+        # asks went unexamined is the whole reason the section exists, so that
+        # one statement stays the tool's to make rather than the file's.
+        cover = c.get('cover') if ids else 'not yet'
+        if cover not in COVER_WORDS:
+            cover = 'partial' if ids else 'not yet'
+        checks.append({'id': str(c.get('id', '?')), 'title': c.get('title', ''),
+                       'rules': ids, 'cover': cover, 'note': c.get('note', '')})
+    prof['checks'] = checks
+    prof.setdefault('name', os.path.basename(path))
+    return prof
+
+
+def apply_profile(opt):
+    """Let the profile fill in anything the caller did not state themselves."""
+    if not opt.profile:
+        opt.profile_data = None
+        return
+    prof = load_profile(opt.profile)
+    for k, v in (prof.get('options') or {}).items():
+        if k not in opt.explicit:          # an explicit flag always wins
+            setattr(opt, k, v)
+    SEV_WORD.update(prof.get('severity_words') or {})
+    opt.profile_data = prof
+
+
+def rule_checks(prof):
+    """rule id -> the ids of the profile checks it contributes to."""
+    out = defaultdict(list)
+    for c in (prof or {}).get('checks') or ():
+        for r in c['rules']:
+            out[r].append(c['id'])
+    return out
+
+
+def print_rules():
+    """The rule table, so it can be read without running anything."""
+    print('')
+    print(' ifc_audit rules')
+    print('')
+    print(' %-6s %-17s %s' % ('rule', 'area', 'title'))
+    for rid, area, title in RULES:
+        print(' %-6s %-17s %s' % (rid, area, title))
+    print('')
+    print(' These are the checks the tool performs.  To report them against an')
+    print(' external checklist - a regulator, a client EIR, a BEP - write a')
+    print(' profile file mapping that checklist onto these ids and pass it with')
+    print(' --profile.  The format is in the header of this script.')
+    print('')
+
+
 
 def collect_findings(res, opt, lab):
     """Everything the reader must decide on, worst first."""
     f = []
     n = len(res)
 
-    def add(sev, area, text):
-        f.append({'sev': sev, 'area': area, 'text': text})
+    def add(sev, rid, text):
+        r = RULE[rid]
+        f.append({'sev': sev, 'id': rid, 'area': r['area'],
+                  'title': r['title'], 'text': text})
 
     # a model that could not be read is not a model that passed
     for name, why in getattr(opt, 'skipped', ()):
-        add(FIX, 'Unreadable', '%s was not audited: %s' % (name, why))
+        add(FIX, 'F01', '%s was not audited: %s' % (name, why))
+
+    # --- the two roots of the spatial hierarchy -----------------------------
+    # Presence, which is all these two ask.  Whether IfcProject really is the
+    # apex with IfcSite below it is S01, which walks the IfcRelAggregates
+    # chain; keeping the two apart matters because a model can hold both
+    # entities and still have them hanging off nothing.
+    #
+    # None and too many are different faults with different fixes, so they are
+    # raised independently: a model with two is still named when another model
+    # in the same package has none.
+    no_proj = [lab[r['file']] for r in res if not r['n_projects']]
+    many_proj = ['%s (%d)' % (lab[r['file']], r['n_projects'])
+                 for r in res if r['n_projects'] > 1]
+    if no_proj:
+        add(FIX, 'F06', 'no IfcProject in %s - IfcProject is the root every '
+            'other entity hangs from, and a file without one carries no units, '
+            'no representation context and no spatial hierarchy, so a receiving '
+            'system has nothing to open it against' % ', '.join(no_proj))
+    if many_proj:
+        add(FIX, 'F06', 'more than one IfcProject in %s - IFC allows exactly '
+            'one, and which one a reader picks up decides the units and the '
+            'representation context it reads the whole file with'
+            % ', '.join(many_proj))
+    if not no_proj and not many_proj:
+        add(PASS, 'F06', 'one IfcProject in each of the %d models' % n)
+
+    no_site = [lab[r['file']] for r in res if not r['n_sites']]
+    if no_site:
+        add(FIX, 'F07', 'no IfcSite in %s - without one the model has nowhere '
+            'to carry a latitude, longitude or address, and nothing states '
+            'where on the earth it sits' % ', '.join(no_site))
+    else:
+        add(PASS, 'F07', 'IfcSite present in each of the %d models' % n)
+
+    multi_site = ['%s (%d)' % (lab[r['file']], r['n_sites'])
+                  for r in res if r['n_sites'] > 1]
+    if multi_site:
+        add(REVIEW, 'F08', 'more than one IfcSite in %s - legal, but the '
+            'georeferencing below reads the first one, and a federated package '
+            'is only aligned if every model agrees on which site that is'
+            % ', '.join(multi_site))
+
+    # --- the spatial tree ---------------------------------------------------
+    broken = [(lab[r['file']], r['spatial']['hierarchy']) for r in res
+              if not r['spatial']['hierarchy']['ok']]
+    if broken:
+        bits = []
+        for l, h in broken[:3]:
+            # one example per model, with a count rather than a page of them;
+            # the SPATIAL STRUCTURE section lists every one
+            rest = ('' if len(h['problems']) < 2
+                    else ' (and %d more in that model)' % (len(h['problems']) - 1))
+            bits.append('%s - %s%s' % (l, h['problems'][0], rest))
+        more = ('' if len(broken) <= 3
+                else '; and %s' % plural(len(broken) - 3, 'further model'))
+        add(FIX, 'S01', 'the spatial hierarchy is not rooted in %s: %s%s - a '
+            'receiving system walks IfcProject > IfcSite > IfcBuilding > '
+            'IfcBuildingStorey to decide what belongs to what, and anything '
+            'off that chain is invisible to it however complete the entity '
+            'itself looks' % (plural(len(broken), 'model'),
+                              '; '.join(bits), more))
+    else:
+        add(PASS, 'S01', 'every IfcSite, IfcBuilding, IfcBuildingStorey and '
+            'IfcSpace in the %d models hangs off the one above it, with '
+            'IfcProject at the apex' % n)
+
+    # --- are there storeys to hold anything? --------------------------------
+    with_st = [lab[r['file']] for r in res if r['spatial']['n_storeys']]
+    no_st = [lab[r['file']] for r in res if not r['spatial']['n_storeys']]
+    if with_st and no_st:
+        add(REVIEW, 'S02', 'no IfcBuildingStorey in %s while the rest of the '
+            'package carries storeys - nothing in those models can be filtered '
+            'or federated by level alongside the others' % ', '.join(no_st))
+    elif not with_st:
+        add(REVIEW, 'S02', 'no IfcBuildingStorey in any of the %d models - '
+            'expected of an infrastructure package, where there are no '
+            'storeys to model, and a gap in a building one, where it means '
+            'nothing states what level anything is on' % n)
+    else:
+        add(PASS, 'S02', '%s across the %d models'
+            % (plural(sum(r['spatial']['n_storeys'] for r in res),
+                      'building storey'), n))
+
+    # --- do the models agree on the storeys? --------------------------------
+    # The single check Phase 2 exists for: two models can each be internally
+    # correct and still not stack, and nothing visible in either one says so.
+    groups = level_groups(res, lab, opt.storey_tol / 1000.0)
+    # each model's own survey height against the package, so a storey
+    # difference that is really the model hanging at the wrong height is sent
+    # to G05 rather than reported again here
+    split, drift = storey_conflicts(groups, opt.storey_datum / 1000.0,
+                                    opt.storey_tol / 1000.0,
+                                    _anchor_offsets(res, lab))
+    if len(with_st) > 1:
+        hard = [d for d in drift if not d['datum'] and not d['anchor']]
+        soft = [d for d in drift if d['datum'] and not d['anchor']]
+        hung = [d for d in drift if d['anchor']]
+        if hung:
+            add(REVIEW, 'S03', '%s at a different height in different models, '
+                'by exactly the amount those models disagree about their own '
+                'survey height: %s - the storeys themselves agree, so this is '
+                'the anchor finding above and not a second fault; fix the '
+                'survey point and these follow'
+                % (plural(len(hung), 'level'),
+                   '; '.join(drift_words(d) for d in hung[:4])))
+        if hard:
+            add(FIX, 'S03', 'the models disagree about where a named level is: '
+                '%s - one of them stacks wrong, and nothing in either model '
+                'looks wrong on its own'
+                % '; '.join(drift_words(d) for d in hard[:4]))
+        if soft:
+            add(REVIEW, 'S03', 'a named level differs between models by less '
+                'than %g mm: %s - a structural model carrying top of concrete '
+                'against an architectural one carrying finished floor level '
+                'reads exactly like this, so confirm the datum rather than '
+                'moving anything'
+                % (opt.storey_datum, '; '.join(drift_words(d) for d in soft[:4])))
+        if split:
+            add(REVIEW, 'S03', '%s named differently between models: %s - '
+                'anything that groups the package by storey, a federated '
+                'viewer or a 4D sequence or a BCF issue list, sees two levels '
+                'where there is one'
+                % (plural(len(split), 'level'),
+                   '; '.join(level_words(g) for g in split[:4])))
+        if not drift and not split:
+            add(PASS, 'S03', 'all %s agree on name and level across the %s '
+                'that carry storeys'
+                % (plural(len(groups), 'level'),
+                   plural(len(with_st), 'model')))
+
+    # --- is every element on a storey? --------------------------------------
+    loose = [(lab[r['file']], r['spatial']['n_loose'])
+             for r in res if r['spatial']['n_loose']]
+    above = [(lab[r['file']], r['spatial']['n_above_storey'])
+             for r in res if r['spatial']['n_above_storey']]
+    if loose:
+        add(FIX, 'S04', '%s in no spatial structure at all in %s - an element '
+            'outside every IfcRelContainedInSpatialStructure belongs to no '
+            'storey, so it shows under no level in a receiving system and is '
+            'skipped by anything that walks the model by storey'
+            % (plural(sum(x[1] for x in loose), 'element'), brief(loose)))
+    if above:
+        add(REVIEW, 'S04', '%s held by the site, the building or another '
+            'container rather than by a storey in %s - correct for external '
+            'works and for anything spanning the whole building, worth '
+            'confirming for the rest'
+            % (plural(sum(x[1] for x in above), 'element'), brief(above)))
+    if not loose and not above and any(r['spatial']['n_in_storey'] for r in res):
+        add(PASS, 'S04', 'every element is contained in a storey')
+
+    # --- are the rooms modelled? --------------------------------------------
+    # Graded on the package, not per model: a structural or piping model with
+    # no IfcSpace is right, and eight findings saying so would bury the one
+    # that matters.
+    with_sp = [(lab[r['file']], r['spatial']['n_spaces'])
+               for r in res if r['spatial']['n_spaces']]
+    if not with_sp:
+        add(REVIEW, 'S05', 'no IfcSpace in any of the %d models - the rooms '
+            'are not modelled, so nothing in this package can be checked, '
+            'scheduled or counted by room, and area takeoff has nothing to '
+            'read' % n)
+    else:
+        add(PASS, 'S05', '%s in %s'
+            % (plural(sum(x[1] for x in with_sp), 'space'), brief(with_sp)))
+    outside = [(lab[r['file']], r['spatial']['n_spaces_outside_storey'])
+               for r in res if r['spatial']['n_spaces_outside_storey']]
+    if outside:
+        add(REVIEW, 'S05', '%s on no storey in %s - a space outside the storey '
+            'it belongs to is not counted in that storey\'s area'
+            % (plural(sum(x[1] for x in outside), 'space'), brief(outside)))
 
     # --- schema: the one that decides whether the package federates at all ---
     by_s = defaultdict(list)
@@ -2203,47 +3042,47 @@ def collect_findings(res, opt, lab):
         if len(odd) == len(schemas):
             # nothing is on target - the package is consistent, just not with
             # the schema it was asked for, so the federation wording is wrong
-            add(FIX, 'Schema', '%s was required but %s%s' % (target, who, note))
+            add(FIX, 'F02', '%s was required but %s%s' % (target, who, note))
         else:
-            add(FIX, 'Schema',
+            add(FIX, 'F02',
                 'the package is %s but %s - a federated set read against two '
                 'schemas gets different entity classes, property sets and '
                 'georeferencing per model%s' % (target, who, note))
     elif len(schemas) > 1:
-        add(REVIEW, 'Schema', 'same schema, mixed addenda: ' + '; '.join(
+        add(REVIEW, 'F03', 'same schema, mixed addenda: ' + '; '.join(
             '%s in %s' % (s, ', '.join(by_s[s])) for s in schemas))
     elif opt.expect_schema and schema_family(schemas[0]) != tfam:
-        add(FIX, 'Schema', 'all models are %s, but %s was required'
+        add(FIX, 'F02', 'all models are %s, but %s was required'
             % (schemas[0], opt.expect_schema))
     else:
-        add(PASS, 'Schema', '%s throughout' % schemas[0])
+        add(PASS, 'F02', '%s throughout' % schemas[0])
 
     units = sorted(set(str(r['length_unit']) for r in res))
     if len(units) > 1:
         by_u = defaultdict(list)
         for r in res:
             by_u[str(r['length_unit'])].append(lab[r['file']])
-        add(FIX, 'Units', 'mixed: ' + '; '.join(
+        add(FIX, 'F04', 'mixed: ' + '; '.join(
             '%s in %s' % (u, ', '.join(by_u[u])) for u in units))
     else:
-        add(PASS, 'Units', '%s throughout' % units[0])
+        add(PASS, 'F04', '%s throughout' % units[0])
 
     named = sorted(set(r['projected_crs'] for r in res if r['projected_crs']))
     blank = [lab[r['file']] for r in res if not r['projected_crs']]
     pre4 = {lab[r['file']] for r in res if not can_map_convert(r['schema'])}
     if len(named) > 1:
-        add(FIX, 'CRS', 'mixed: ' + ', '.join(named))
+        add(FIX, 'G01', 'mixed: ' + ', '.join(named))
     elif not named:
-        add(REVIEW, 'CRS', 'no IfcProjectedCRS declared in any model')
+        add(REVIEW, 'G01', 'no IfcProjectedCRS declared in any model')
     elif not blank:
-        add(PASS, 'CRS', '%s throughout' % named[0])
+        add(PASS, 'G01', '%s throughout' % named[0])
     elif set(blank) <= pre4:
         # not a disagreement about the CRS - those models have nowhere to put
         # one, which the schema finding already covers
-        add(REVIEW, 'CRS', '%s wherever the schema allows one; %s cannot carry '
+        add(REVIEW, 'G01', '%s wherever the schema allows one; %s cannot carry '
             'an IfcProjectedCRS at all' % (named[0], ', '.join(blank)))
     else:
-        add(FIX, 'CRS', '%s in some models, none in %s'
+        add(FIX, 'G01', '%s in some models, none in %s'
             % (named[0], ', '.join(blank)))
 
     # --- model view definition ---
@@ -2252,14 +3091,31 @@ def collect_findings(res, opt, lab):
     if len(views) > 1 and not mixed_schema:
         # when the schemas differ this is a restatement of that, because the
         # exporter picks the string from the schema
-        add(FIX, 'View definition', 'mixed: ' + ', '.join(views))
+        add(FIX, 'F05', 'mixed: ' + ', '.join(views))
     if opt.expect_view:
         want = split_view(opt.expect_view)[0]
-        off = [lab[r['file']] for r in res
+        off = [r for r in res
                if split_view(r['view_definition'] or '')[0] != want]
-        if off:
-            add(FIX, 'View definition',
-                'not exported as %s: %s' % (opt.expect_view, ', '.join(off)))
+        # A header the exporter writes from the schema is not evidence of the
+        # setup used - v3 observed Revit writing CoordinationView into a file
+        # exported with the IFC4x3 Reference View setup.  Those models cannot
+        # be said to have the wrong MVD, only to be unable to prove the right
+        # one, so they are graded apart from a header that really does differ.
+        mute = [lab[r['file']] for r in off
+                if exporter_artefact(split_view(r['view_definition'] or '')[0],
+                                     schema_family(r['schema']),
+                                     r['authoring_tool'])]
+        hard = [lab[r['file']] for r in off if lab[r['file']] not in mute]
+        if hard:
+            add(FIX, 'F05', '%s required but not declared by %s - the header '
+                'names a different MVD, so anything reading it is told the '
+                'wrong one' % (opt.expect_view, ', '.join(hard)))
+        if mute:
+            add(REVIEW, 'F05', '%s cannot be confirmed as %s: the exporter '
+                'writes that header string from the schema whatever view setup '
+                'was chosen, so check the export setup itself and state the '
+                'intended MVD to the receiving side, because the file will not'
+                % (', '.join(mute), opt.expect_view))
     # a model the schema finding already named does not need a second finding
     # restating it as an MVD problem; grade the view on the models that are not
     # already accounted for
@@ -2267,7 +3123,7 @@ def collect_findings(res, opt, lab):
     cand = [r for r in res if lab[r['file']] not in named] or res
     worst = min(cand, key=lambda r: rank[r['view_status'][0]])
     sev, text = worst['view_status']
-    add(sev, 'View definition',
+    add(sev, 'F05',
         text if (len(cand) == 1 or sev == PASS)
         else '%s: %s' % (lab[worst['file']], text))
 
@@ -2277,7 +3133,7 @@ def collect_findings(res, opt, lab):
     stuck = [lab[r['file']] for r in res
              if not can_map_convert(r['schema']) and georef_level(r) < 50]
     if stuck:
-        add(FIX, 'Georeferencing',
+        add(FIX, 'G02',
             '%s on a pre-IFC4 schema, which has no IfcMapConversion or '
             'IfcProjectedCRS - re-export as IFC4 or later first, because no '
             'georeferencing setting can lift %s to LoGeoRef 50'
@@ -2291,17 +3147,17 @@ def collect_findings(res, opt, lab):
     if not fixable:
         pass
     elif worst_lv >= 50:
-        add(PASS, 'Georeferencing',
+        add(PASS, 'G02',
             'IfcMapConversion + IfcProjectedCRS in all %d models'
             % len(fixable))
     elif worst_lv >= 30:
         # positioned, but by a mechanism that carries no declaration of intent
-        add(REVIEW, 'Georeferencing',
+        add(REVIEW, 'G02',
             'positioned by the IfcSite placement, not IfcMapConversion (LoGeoRef %d); '
             '%s left at all zeros - see HOW TO FIX'
             % (worst_lv, plural(n_ph, 'MapConversion') if n_ph else 'no MapConversion'))
     else:
-        add(FIX, 'Georeferencing',
+        add(FIX, 'G02',
             'models are not georeferenced (LoGeoRef %d) - %s; see HOW TO FIX'
             % (worst_lv, ', '.join(
                 p for p in (plural(n_ph, 'placeholder') if n_ph else '',
@@ -2321,11 +3177,11 @@ def collect_findings(res, opt, lab):
                 worst = max(vals) - min(vals)
                 which = label
         if worst > opt.geo_tol / mu:
-            add(FIX, 'Georeferencing',
+            add(FIX, 'G03',
                 'MapConversion %s differs by %.1f mm across %d models'
                 % (which, worst * mu, len(with_mc)))
         else:
-            add(PASS, 'Georeferencing',
+            add(PASS, 'G03',
                 'all %d MapConversions agree within %.0f mm' % (len(with_mc), opt.geo_tol))
 
     bad_scale = [lab[r['file']] for r in with_mc
@@ -2335,7 +3191,7 @@ def collect_findings(res, opt, lab):
                          - expected_scale(r['unit_to_mm'], r['map_unit_to_mm']))
                  > expected_scale(r['unit_to_mm'], r['map_unit_to_mm']) * 1e-6]
     if bad_scale:
-        add(FIX, 'Georeferencing',
+        add(FIX, 'G04',
             'MapConversion Scale wrong for its units in %s' % ', '.join(bad_scale))
 
     # --- do the models agree on one real-world anchor? ---
@@ -2353,32 +3209,32 @@ def collect_findings(res, opt, lab):
             mid = [median([a[1][k] for a in anchors]) for k in range(3)]
             far = max(anchors, key=lambda a: max(abs(a[1][k] - mid[k]) for k in range(3)))
             off = [far[1][k] - mid[k] for k in range(3)]
-            add(FIX, 'Site anchor',
+            add(FIX, 'G05',
                 'models do not share one survey point: spread %.3f m; %s is off by '
                 'E %.3f, N %.3f, H %.3f m'
                 % (worst, lab[far[0]['file']], off[0], off[1], off[2]))
         else:
-            add(PASS, 'Site anchor',
+            add(PASS, 'G05',
                 'all %d models share one survey point (within %.0f mm)'
                 % (len(anchors), opt.geo_tol))
 
     # --- duplicates ---
     guid = [(lab[r['file']], r['dup_guid_extra']) for r in res if r['dup_guid_extra']]
     if guid:
-        add(FIX, 'GlobalIds', 'repeated GlobalId (invalid file) in %s'
+        add(FIX, 'D01', 'repeated GlobalId (invalid file) in %s'
             % ', '.join('%s (%d)' % g for g in guid))
 
     dup = [(lab[r['file']], r['n_duplicate_extra']) for r in res if r['n_duplicate_extra']]
     if dup:
-        add(FIX, 'Duplicates', '%s in %s'
+        add(FIX, 'D02', '%s in %s'
             % (plural(sum(d[1] for d in dup), 'duplicated element'),
                brief(dup)))
     else:
-        add(PASS, 'Duplicates', 'none found')
+        add(PASS, 'D02', 'none found')
 
     prob = [(lab[r['file']], r['n_probable_groups']) for r in res if r['n_probable_groups']]
     if prob:
-        add(REVIEW, 'Probable dups', '%s that could not be confirmed in %s'
+        add(REVIEW, 'D03', '%s that could not be confirmed in %s'
             % (plural(sum(p[1] for p in prob), 'group'),
                brief(prob)))
 
@@ -2387,14 +3243,14 @@ def collect_findings(res, opt, lab):
            for r in res if r['n_elements']
            and r['n_with_body_geometry'] < r['n_elements'] * opt.min_geometry]
     if low:
-        add(FIX, 'Geometry', 'geometry unresolved for a large share of %s'
+        add(FIX, 'X01', 'geometry unresolved for a large share of %s'
             % ', '.join('%s (%.0f%% resolved)' % l for l in low))
 
     # --- IfcClass / PredefinedType ---
     prox = [(lab[r['file']], r['classification']['n_proxy'])
             for r in res if r['classification']['n_proxy']]
     if prox:
-        add(FIX, 'Proxies', '%s left as a generic proxy in %s - the exporter '
+        add(FIX, 'C01', '%s left as a generic proxy in %s - the exporter '
             'could not map them to an IFC class, so nothing downstream knows '
             'what they are'
             % (plural(sum(p[1] for p in prox), 'element'), brief(prox)))
@@ -2404,16 +3260,16 @@ def collect_findings(res, opt, lab):
                for r in res if r['classification']['n']]
     low_cls = [c for c in cls_pct if c[1] < opt.min_classified * 100]
     if low_cls:
-        add(REVIEW, 'Classification',
+        add(REVIEW, 'C02',
             'PredefinedType missing or unspecific on %s'
             % ', '.join('%s (%.0f%% classified)' % c for c in low_cls))
     elif not prox and cls_pct:
-        add(PASS, 'Classification', 'IfcClass and PredefinedType set throughout')
+        add(PASS, 'C02', 'IfcClass and PredefinedType set throughout')
 
     bt = [(lab[r['file']], r['n_bad_type_objects'])
           for r in res if r['n_bad_type_objects']]
     if bt:
-        add(REVIEW, 'Schema rule', '%s with PredefinedType USERDEFINED and no '
+        add(REVIEW, 'C03', '%s with PredefinedType USERDEFINED and no '
             'ElementType in %s - USERDEFINED is allowed, but with ElementType '
             'blank nothing states what the type is; assign a proper '
             'PredefinedType, or name the type in ElementType'
@@ -2422,24 +3278,24 @@ def collect_findings(res, opt, lab):
     # --- floating ---
     det = [(lab[r['file']], r['n_detached']) for r in res if r['n_detached']]
     if det:
-        add(FIX, 'Floating', '%s detached from the model in %s - displaced by '
+        add(FIX, 'X02', '%s detached from the model in %s - displaced by '
             'more than %g times the spread of everything else'
             % (plural(sum(x[1] for x in det), 'element'), brief(det),
                opt.float_detach))
     out_ly = [(lab[r['file']], r['n_outlying']) for r in res if r['n_outlying']]
     if out_ly:
-        add(REVIEW, 'Floating', '%s outside the usual envelope of %s but still '
+        add(REVIEW, 'X02', '%s outside the usual envelope of %s but still '
             'within reach of it - check each against the architectural and '
             'structural envelope before moving anything'
             % (plural(sum(x[1] for x in out_ly), 'element'), brief(out_ly)))
     if not det and not out_ly:
-        add(PASS, 'Floating', 'none found')
+        add(PASS, 'X02', 'none found')
 
     # --- interferences (informational) ---
     if opt.clash:
         it = [(lab[r['file']], r['n_interferences']) for r in res if r['n_interferences']]
         if it:
-            add(REVIEW, 'Interferences', '%s of overlapping different-type elements in %s'
+            add(REVIEW, 'X03', '%s of overlapping different-type elements in %s'
                 % (plural(sum(x[1] for x in it), 'pair'),
                    brief(it)))
 
@@ -2470,18 +3326,23 @@ def report(res, opt):
     rule()
     print('')
     if n_fix or n_rev:
-        bits = []
-        if n_fix:
-            bits.append(plural(n_fix, 'issue'))
-        if n_rev:
-            bits.append('%d to review' % n_rev)
+        if getattr(opt, 'profile', None):
+            # beside a Model Checker report, in its words
+            bits = ['%d %s' % (c, SEV_WORD[sv])
+                    for c, sv in ((n_fix, FIX), (n_rev, REVIEW)) if c]
+        else:
+            bits = []
+            if n_fix:
+                bits.append(plural(n_fix, 'issue'))
+            if n_rev:
+                bits.append('%d to review' % n_rev)
         print(' RESULT: %s' % ', '.join(bits))
     else:
         print(' RESULT: no issues found')
     print('')
     for f in findings:
-        print(' %-4s %-15s %s' % ('[%s]' % f['sev'], f['area'],
-                                   wrap(f['text'], SECTION_W - 22, 22)))
+        print(' %-4s %-4s %-15s %s' % ('[%s]' % f['sev'], f['id'], f['area'],
+                                       wrap(f['text'], SECTION_W - 27, 27)))
 
     # ---------------- models ----------------
     section('MODELS')
@@ -2495,6 +3356,7 @@ def report(res, opt):
         print('  * length unit could not be read; millimetres assumed')
 
     _export_section(res, opt, lab, lw)
+    _spatial_section(res, opt, lab, lw)
     _geo_section(res, opt, lab, lw)
     _dup_section(res, opt, lab, lw)
     if opt.clash:
@@ -2502,7 +3364,49 @@ def report(res, opt):
     _float_section(res, opt, lab, lw)
     _class_section(res, opt, lab, lw)
     _diag_section(res, opt, lab, lw)
+    if getattr(opt, 'profile_data', None):
+        _profile_section(opt.profile_data, findings)
     print('')
+
+
+def _profile_section(prof, findings):
+    """The profile's own checklist, against what this run actually did.
+
+    Printed rather than merely recorded, because the gap is the point.  A
+    reader who sees a page of rule ids and no gap list will take the run as
+    equivalent to whatever external check the profile answers, and it is not
+    one: the tool reports what it reports, and the body that set the
+    checklist is the one whose result counts.
+    """
+    checks = prof.get('checks') or ()
+    if not checks:
+        return
+    section('PROFILE COVERAGE')
+    name = prof.get('name') or 'profile'
+    if prof.get('version'):
+        name += '  (%s)' % prof['version']
+    print('  %s' % name)
+    if prof.get('description'):
+        print('%s%s' % ('  ', wrap(prof['description'], SECTION_W - 2, 2)))
+    print('')
+    # findings arrive worst-first, so the first severity seen for an id is the
+    # worst that id reached on this package
+    raised = {}
+    for f in findings:
+        raised.setdefault(f['id'], f['sev'])
+    cw = max([len(c['id']) for c in checks] + [5])
+    tw = min(max([len(c['title']) for c in checks] + [10]), 44) + 1
+    print('  %-*s %-*s %-8s %s' % (cw, 'check', tw, 'what it is', 'here', 'rules'))
+    for c in checks:
+        marks = ' '.join('%s[%s]' % (i, raised[i]) if i in raised else i
+                         for i in c['rules'])
+        print('  %-*s %-*s %-8s %s' % (cw, c['id'], tw, c['title'],
+                                       c['cover'], marks))
+        if c['note']:
+            print('%s%s' % (' ' * 14, wrap(c['note'], SECTION_W - 14, 14)))
+    print('')
+    print('  A rule id with no [!] [?] or [ok] beside it did not run on this')
+    print('  package - an empty section is not a pass.')
 
 
 SECTION_W = 88
@@ -2521,6 +3425,132 @@ def support_footer():
     print('    - Validation changes')
     print('    - Bugs')
     print('')
+
+
+def _spatial_section(res, opt, lab, lw):
+    section('SPATIAL STRUCTURE   '
+            '(IfcProject > IfcSite > IfcBuilding > IfcBuildingStorey)')
+    print('  %-*s %-6s %-7s %-6s %-20s %s'
+          % (lw, 'model', 'rooted', 'storeys', 'spaces', 'on a storey',
+             'elsewhere'))
+    for r in res:
+        sp = r['spatial']
+        total = r['n_elements']
+        on = sp['n_in_storey']
+        rest = []
+        if sp['n_above_storey']:
+            rest.append('%d on site/building' % sp['n_above_storey'])
+        if sp['n_loose']:
+            rest.append('%d in nothing [!]' % sp['n_loose'])
+        pct = (100.0 * on / total) if total else 0.0
+        print(('  %-*s %-6s %-7d %-6d %-20s %s' % (
+            lw, lab[r['file']],
+            'ok' if sp['hierarchy']['ok'] else 'no[!]',
+            sp['n_storeys'], sp['n_spaces'],
+            '%d/%d  (%.0f%%)' % (on, total, pct) if total else '-',
+            ', '.join(rest) or ('-' if total else ''))).rstrip())
+
+    # -- what is wrong with the tree ----------------------------------------
+    if any(r['spatial']['hierarchy']['problems'] for r in res):
+        print('')
+        print('  NOT ROOTED   aggregated into nothing, or into the wrong thing')
+    for r in res:
+        probs = r['spatial']['hierarchy']['problems']
+        if not probs:
+            continue
+        print('')
+        print('  %s' % lab[r['file']])
+        for p in probs[:opt.max_rows]:
+            print('    %s' % wrap(p, SECTION_W - 4, 4))
+        if len(probs) > opt.max_rows:
+            print('    ... and %s more'
+                  % plural(len(probs) - opt.max_rows, 'problem'))
+
+    # -- the levels of the package ------------------------------------------
+    groups = level_groups(res, lab, opt.storey_tol / 1000.0)
+    if groups:
+        _levels_block(res, opt, lab, groups)
+    elif any(r['spatial']['n_storeys'] for r in res):
+        print('')
+        print('  No IfcBuildingStorey carries a placement this tool could')
+        print('  resolve, so there are no levels to compare.')
+
+    # -- elements that are not on a storey ----------------------------------
+    off = [r for r in res
+           if r['spatial']['n_loose'] or r['spatial']['n_above_storey']]
+    if off:
+        print('')
+        print('  NOT ON A STOREY')
+    for r in off:
+        sp = r['spatial']
+        print('')
+        print('  %s' % lab[r['file']])
+        if sp['n_loose']:
+            print('    in no spatial structure at all:')
+            for cls, c in sp['loose_by_class'][:opt.max_rows]:
+                ids = [x['id'] for x in sp['loose'] if x['class'] == cls][:4]
+                print('      [!] %-26s %-14s %s'
+                      % (ifc_name(cls), plural(c, 'element'),
+                         ', '.join('#%d' % i for i in ids)))
+        if sp['n_above_storey']:
+            print('    held above storey level:')
+            for where, c in sp['above_by_container'][:opt.max_rows]:
+                print('      [?] %-26s %s' % (where, plural(c, 'element')))
+
+
+def _levels_block(res, opt, lab, groups):
+    """The levels of the package, and where the models disagree about them."""
+    split, drift = storey_conflicts(groups, opt.storey_datum / 1000.0,
+                                    opt.storey_tol / 1000.0,
+                                    _anchor_offsets(res, lab))
+    drift_keys = dict((norm_storey(d['name']), d) for d in drift)
+
+    print('')
+    print('  LEVELS   the storey placement plus whatever height the model')
+    print('           carries in IfcMapConversion - metres in the survey')
+    print('           datum, so a model holding the offset in its site')
+    print('           placement compares with one holding it in')
+    print('           MapConversion.  Storeys within %g mm read as one level.'
+          % opt.storey_tol)
+    print('')
+    nw = min(max([len(n['name']) for g in groups for n in g['names']] + [5]), 26)
+    for g in reversed(groups):               # top of the building first
+        lead = '%+9.3f' % g['z']
+        for n in g['names']:
+            mark = ''
+            if len(g['names']) > 1:
+                mark = ' [?]'
+            d = drift_keys.get(n['key'])
+            if d:
+                mark = ' [?]' if (d['datum'] or d['anchor']) else ' [!]'
+            print(('   %-9s  %-*s  %s%s' % (
+                lead, nw, n['name'], ', '.join(n['models']), mark)).rstrip())
+            lead = ''
+
+    if split or drift:
+        print('')
+        for d in drift[:opt.max_rows]:
+            if d['anchor']:
+                why = ('the models hang at different survey heights by this '
+                       'same amount, so the storeys agree - see the site '
+                       'anchor finding')
+            elif d['datum']:
+                why = ('a datum difference of %.0f mm; finished floor level '
+                       'against top of concrete reads like this'
+                       % (d['spread_m'] * 1000.0))
+            else:
+                why = 'one of them stacks wrong'
+            print('   %s %s'
+                  % ('[?]' if (d['datum'] or d['anchor']) else '[!]',
+                     wrap(drift_words(d) + ' - ' + why, SECTION_W - 7, 7)))
+        for g in split[:opt.max_rows]:
+            print('   [?] %s' % wrap(
+                level_words(g) + ' - one level, more than one name',
+                SECTION_W - 7, 7))
+        hidden = max(0, len(drift) - opt.max_rows) + max(0, len(split) - opt.max_rows)
+        if hidden:
+            print('   ... and %s not shown'
+                  % plural(hidden, 'further disagreement'))
 
 
 def _geo_section(res, opt, lab, lw):
@@ -2576,7 +3606,8 @@ def _geo_section(res, opt, lab, lw):
         print('  RefElevation unset or zero in %d of %d models' % (n_noelev, len(res)))
     multi = [lab[r['file']] for r in res if r['n_sites'] > 1]
     if multi:
-        print('  More than one IfcSite in %s   [!]' % ', '.join(multi))
+        print('  More than one IfcSite in %s - the rows below read the '
+              'first one (F08)' % ', '.join(multi))
 
     # where each model's own origin actually lands, and whether they agree
     anchors = [(r, georef_anchor(r)) for r in res
@@ -3026,7 +4057,11 @@ def write_xlsx(path, sheets):
 # ----------------------------------------------------------------------------
 
 SEV_STYLE = {'!': S_FIX, '?': S_REVIEW, 'ok': S_PASS}
-SEV_WORD = {'!': 'FIX', '?': 'REVIEW', 'ok': 'PASS'}
+
+# The three grades never change; only what they are called does.  A profile
+# renames them with severity_words, so a report that sits beside a checker
+# using FAIL / ALERT / PASS can be read in the same words.
+SEV_WORD = {'!': 'FIX', '?': 'REVIEW', 'ok': 'PASS'}   # updated by --profile
 
 
 def _hdr(*names):
@@ -3048,13 +4083,17 @@ def excel_report(path, res, opt):
           [('Generated', S_SUB), stamp],
           [('Result', S_SUB),
            'no issues found' if not (n_fix or n_rev)
-           else '%d to fix, %d to review' % (n_fix, n_rev)],
+           else ', '.join('%d %s' % (c, SEV_WORD[sv]) for c, sv
+                          in ((n_fix, FIX), (n_rev, REVIEW)) if c)],
           [],
-          _hdr('Severity', 'Area', 'Finding')]
+          _hdr('Rule', 'Severity', 'Area', 'Rule title', 'Finding',
+               'Profile check')]
     head_row = len(s1)
+    rc = rule_checks(getattr(opt, 'profile_data', None))
     for f in findings:
-        s1.append([(SEV_WORD[f['sev']], SEV_STYLE[f['sev']]), f['area'],
-                   (f['text'], S_WRAP)])
+        s1.append([f['id'], (SEV_WORD[f['sev']], SEV_STYLE[f['sev']]),
+                   f['area'], f['title'], (f['text'], S_WRAP),
+                   ', '.join(rc.get(f['id'], ()))])
 
     # ---- Models ----
     s2 = [_hdr('Model', 'File', 'Schema', 'View definition', 'MVD check',
@@ -3154,6 +4193,84 @@ def excel_report(path, res, opt):
 
     sheets = [('Summary', s1, head_row), ('Models', s2, 1),
               ('Georeferencing', sg, 1), ('Duplicates', s3, 1)]
+
+    # ---- Spatial structure ----
+    # One row per storey per model, with the level group each one fell into:
+    # sorting the sheet by that column puts the storeys that are meant to be
+    # the same level next to each other, which is where a naming disagreement
+    # becomes obvious.
+    groups = level_groups(res, lab, opt.storey_tol / 1000.0)
+    split, drift = storey_conflicts(groups, opt.storey_datum / 1000.0,
+                                    opt.storey_tol / 1000.0,
+                                    _anchor_offsets(res, lab))
+    drift_keys = dict((norm_storey(d['name']), d) for d in drift)
+    grp_of = {}
+    for g in groups:
+        for n in g['names']:
+            for l, s in n['rows']:
+                grp_of[(l, s['id'])] = (g, n)
+    ss = [_hdr('Model', 'Storey', 'Long name', 'Elevation attribute (m)',
+               'Project Z (m)', 'Level in survey datum (m)',
+               'Level of the package (m)', 'Agreement', 'Why',
+               'Also called', 'Elements', 'Spaces', 'Composition')]
+    for r in res:
+        for s in r['spatial']['storeys']:
+            g, n = grp_of.get((lab[r['file']], s['id']), (None, None))
+            d = drift_keys.get(norm_storey(s['name']))
+            sev = None
+            why = ''
+            if d and d['anchor']:
+                sev, why = REVIEW, ('this name is used at another level, by '
+                                    'the amount the models disagree about '
+                                    'their own survey height - see G05')
+            elif d and not d['datum']:
+                sev, why = FIX, 'this name is used at another level'
+            elif d:
+                sev, why = REVIEW, ('this name is used at a level %.0f mm '
+                                    'away, which is datum-sized - finished '
+                                    'floor level against top of concrete'
+                                    % (d['spread_m'] * 1000.0))
+            elif g is not None and len(g['names']) > 1:
+                sev, why = REVIEW, 'this level has another name in another model'
+            others = '' if g is None else ', '.join(
+                '%s (%s)' % (o['name'], ', '.join(o['models']))
+                for o in g['names'] if o['key'] != n['key'])
+            ss.append([lab[r['file']], s['name'], s['long_name'],
+                       s['elevation_m'], s['z_m'], s['level_m'],
+                       None if g is None else round(g['z'], 4),
+                       (SEV_WORD[sev] if sev else 'OK',
+                        SEV_STYLE[sev] if sev else S_PLAIN),
+                       (why, S_WRAP),
+                       others, s['n_elements'], s['n_spaces'],
+                       s['composition'] or ''])
+    for r in res:
+        for p in r['spatial']['hierarchy']['problems']:
+            ss.append([lab[r['file']], '(hierarchy)', '', None, None, None,
+                       None, (SEV_WORD[FIX], S_FIX), (p, S_WRAP), '',
+                       None, None, ''])
+    if len(ss) > 1:
+        sheets.append(('Spatial structure', ss, 1))
+
+    # ---- Elements not on a storey ----
+    if any(r['spatial']['n_loose'] or r['spatial']['n_above_storey'] for r in res):
+        su = [_hdr('Model', 'Severity', 'Element', 'IFC class', 'Type / family',
+                   'Held by', 'Why it matters')]
+        for r in res:
+            for x in r['spatial']['loose']:
+                su.append([lab[r['file']], (SEV_WORD[FIX], S_FIX),
+                           '#%d' % x['id'], ifc_name(x['class']), x['type'],
+                           'nothing',
+                           ('in no IfcRelContainedInSpatialStructure, so it is '
+                            'on no level and is skipped by anything that walks '
+                            'the model by storey', S_WRAP)])
+            for x in r['spatial']['above_storey']:
+                su.append([lab[r['file']], (SEV_WORD[REVIEW], S_REVIEW),
+                           '#%d' % x['id'], ifc_name(x['class']), x['type'],
+                           x['container'],
+                           ('contained above storey level - correct for '
+                            'external works and for anything spanning the '
+                            'building, worth confirming otherwise', S_WRAP)])
+        sheets.append(('Elements off storey', su, 1))
 
     # ---- Classification ----
     s7 = [_hdr('Model', 'Severity', 'Element', 'IFC class', 'PredefinedType',
@@ -3255,6 +4372,15 @@ def main():
                     help='overlap fraction of the smaller element to report (default 0.30)')
     ap.add_argument('--geo-tol', type=float, default=1.0,
                     help='MapConversion agreement tolerance in mm (default 1)')
+    ap.add_argument('--storey-tol', type=float, default=50.0,
+                    help='storeys within this many mm of each other are read '
+                         'as the same level of the package (default 50)')
+    ap.add_argument('--storey-datum', type=float, default=600.0,
+                    help='a storey name found at two levels further apart than '
+                         '--storey-tol but within this many mm is reported as '
+                         'a datum difference to confirm - finished floor level '
+                         'against top of concrete - rather than as a fault '
+                         '(default 600)')
     ap.add_argument('--min-geometry', type=float, default=0.90,
                     help='flag a model whose resolved-geometry share falls below '
                          'this fraction (default 0.90)')
@@ -3269,8 +4395,32 @@ def main():
                          'e.g. ReferenceView_V1.2')
     ap.add_argument('--max-rows', type=int, default=20,
                     help='max rows printed per section per model (default 20)')
+    ap.add_argument('--profile', metavar='FILE.json',
+                    help='apply a submission profile: a JSON file stating what '
+                         'this project, client or authority asks for - schema, '
+                         'MVD, thresholds, the words for the three grades, and '
+                         'the external checklist to report against.  Options '
+                         'you pass yourself always win')
+    ap.add_argument('--rules', action='store_true',
+                    help='print the rule table and exit; no model needed')
     opt = ap.parse_args()
     opt.skipped = []
+
+    if opt.rules:
+        print_rules()
+        return
+
+    # which options the caller actually stated, so a profile fills in the rest
+    # without ever overriding something they asked for by name
+    blank = ap.parse_args([])
+    opt.explicit = set(k for k, v in vars(opt).items()
+                       if getattr(blank, k, None) != v)
+    try:
+        apply_profile(opt)
+    except (ValueError, IOError, OSError) as e:
+        print('Could not use profile %s:' % opt.profile)
+        print('  %s' % e)
+        sys.exit(2)
 
     files = []
     for p in opt.paths:
@@ -3304,8 +4454,23 @@ def main():
     report(res, opt)
 
     if opt.json:
+        # v4 wraps what v3 dumped as a bare list.  The findings carry the rule
+        # ids, and a list has nowhere to put them.
+        doc = {'tool': 'ifc_audit v4',
+               'generated': datetime.datetime.now().isoformat(timespec='seconds'),
+               # which requirement revision this was run against, not just
+               # the path it was read from - a report that cannot say that is
+               # not evidence of anything a year later
+               'profile': None if not opt.profile_data else
+                          {'file': opt.profile,
+                           'name': opt.profile_data.get('name'),
+                           'version': opt.profile_data.get('version'),
+                           'checks': opt.profile_data.get('checks')},
+               'rules': [RULE[r[0]] for r in RULES],
+               'findings': collect_findings(res, opt, model_labels(res)),
+               'models': res}
         with open(opt.json, 'w', encoding='utf-8') as fh:
-            json.dump(res, fh, indent=1, default=str)
+            json.dump(doc, fh, indent=1, default=str)
         print('Raw JSON -> %s' % opt.json)
 
     if opt.excel:
