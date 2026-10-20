@@ -16,8 +16,8 @@ Instructions
 	4. Command "python ifc_audit.py"
 
 --------------------------------------------------------------------------
-v4 - rule ids, profiles and spatial structure
-     (roadmap; Phases 1 and 2 landed 20 Oct 2026)
+v4 - rule ids, profiles, spatial structure and BCF
+     (roadmap; Phases 1, 2 and 3 landed 20 Oct 2026)
 --------------------------------------------------------------------------
 Why this direction
 	Up to v3 this tool was a narrator. It found a problem and explained in
@@ -58,18 +58,17 @@ Phase 2 - spatial structure                              (landed)
 	on a storey, its storeys agreeing between the disciplines, and its tree
 	rooted at the IfcProject.
 
-Phase 3 - BCF export                                     (next)
-	Scheduled before the property work because it is small and because it
-	changes who can act on the report. A finding in a text file has to be
-	found again by hand in the authoring tool; a finding in BCF opens next
-	to the element that caused it.
+Phase 3 - BCF export                                     (landed)
+	--bcf FILE.bcfzip writes a BCF 2.1 issue list. See "What landed in
+	Phase 3" below.
 
-	Every finding already carries element ids and bounding boxes, so the
-	viewpoint geometry is in hand, and BCF 2.1 is a zip of markup.bcf and
-	viewpoint.bcfv per topic - the same zipfile machinery the .xlsx writer
-	already uses, so the no-install promise survives.
+	It was scheduled before the property work because it is small and
+	because it changes who can act on the report. A finding in a text file
+	has to be found again by hand in the authoring tool; a finding in BCF
+	opens next to the element that caused it.
 
-Phase 4 - property sets and required-information schedules  (the large one)
+Phase 4 - property sets and required-information schedules
+         (next, and the large one)
 	Parse IfcPropertySet, IfcRelDefinesByProperties and
 	IfcPropertySingleValue, filtered to the property names the active
 	profile actually asks for, so a run without a profile pays nothing.
@@ -118,6 +117,97 @@ What this tool is not
 	report states which of the asks this run did not look at. A check that
 	did not run must not read as a check that passed - the same reason v3
 	started counting the elements left out of the duplicate pass.
+
+What landed in Phase 3
+	--bcf FILE.bcfzip writes a BCF 2.1 issue list beside the report:
+
+	  python ifc_audit.py --bcf audit.bcfzip
+
+	Open it in Revit, Navisworks, Solibri, BIMcollab, usBIM or anything
+	else that reads BCF, and each finding opens next to the element that
+	caused it, with the prose attached as a comment. Still no install: BCF
+	2.1 is a zip of small XML files, written with the same standard-library
+	zipfile the .xlsx writer uses, and the snapshots are PNGs written with
+	zlib.
+
+	One topic per place somebody has to stand, which is not one per
+	finding. "213 elements left as a generic proxy" is one finding and one
+	topic per model - they are all fixed in the same export setting.
+	"11 duplicated elements" is one finding and eleven places to stand. A
+	rule that names no elements - a schema mix, a survey point - stays one
+	topic for the package, because there is nowhere else to put the camera.
+
+	Only FIX and REVIEW become topics. An issue list that arrives with
+	twelve topics saying PASS is one nobody opens twice.
+
+The topic GUID is derived, not random
+	A topic's GUID is a UUID5 of the rule, the model and what the topic is
+	about, so the same finding keeps the same GUID every run.
+
+	This is what makes the export usable as an issue list rather than a
+	weekly dump. Re-run the audit after a fix and a BCF tool recognises the
+	topics it already has - closed, assigned, commented on - instead of
+	filling the project with duplicates of them. Issues that were fixed
+	simply stop being written.
+
+	Group topics are identified by what they are about: this rule, this
+	model, one export setting to change. Instance topics - a duplicate
+	pair, a floating element - are identified by the GlobalIds of the
+	elements themselves, because a STEP id changes on the next export and a
+	GlobalId does not.
+
+What a receiving tool is given
+	  the selection   the elements, by IfcGuid. The STEP line number is
+	                  carried too, in AuthoringToolId, because that is what
+	                  the report and the workbook print - but it is not what
+	                  the selection is keyed on.
+	  the camera      an orthogonal camera looking down at those elements
+	                  from the south-west, framed on their combined extent.
+	                  BCF coordinates are metres in the IFC file's own
+	                  coordinate system, which is why the camera works in
+	                  project coordinates rather than the survey datum the
+	                  storey check compares levels in.
+	  the snapshot    a plan of the model with the topic's elements marked
+	                  on it, red for FIX and amber for REVIEW.
+	  the prose       the instance detail as the description, and the rule's
+	                  own statement as the first comment. The explanation is
+	                  the part of this tool worth carrying, so it travels
+	                  with the topic rather than staying in the text file.
+
+	Nothing is hidden: the whole model stays visible, because the context is
+	what tells the author whether a finding matters. An element 5 m above
+	the pipework reads very differently with the building around it.
+
+	The snapshot is not a render. This tool has no geometry kernel and does
+	not want one. It is the one thing the XML cannot carry: enough of a
+	picture to tell, from the list, whether a finding sits in the middle of
+	the building or out on its own. Eight marks in a line is a copied block;
+	one mark in the corner is a stray.
+
+	A topic about the package rather than one model draws every model's
+	footprint instead, in map coordinates. That is the frame a federated set
+	actually lands in - a model exported on its survey point carries its
+	offset in IfcMapConversion and sits near the project origin until that
+	is applied - so the plan shows the models stacked on each other and the
+	one genuinely out of place is the one that stands out. The camera cannot
+	follow it there, because a viewpoint is read against one file's own
+	coordinates; it frames the models that share a frame with each other
+	instead, found from the median centre, so one model on a different
+	coordinate base cannot drag the view into the empty space between them.
+
+Why there is a cap
+	--bcf-max 200 is the most topics written, and they are taken worst
+	first and then a rule at a time rather than straight off the top.
+
+	One noisy rule would otherwise fill the file on its own. On the test
+	package a thousand interference pairs would bury eleven duplicated
+	elements, and the duplicates are the ones somebody has to act on. Taken
+	a rule at a time, every rule that found something gets into the file.
+
+	Whatever did not fit is counted and printed, per rule, with a line
+	saying the report and the workbook still carry all of it. A topic that
+	did not fit is not a finding that went away - the same reason the
+	duplicate check counts the elements it left out.
 
 What landed in Phase 2
 	The spatial tree is read: IfcBuildingStorey, IfcSpace,
@@ -602,11 +692,18 @@ Reading the report
 	Output is plain ASCII, so "python ifc_audit.py > report.txt" is safe.
 
 Sharing the results
-	  python ifc_audit.py --excel audit.xlsx
+	  python ifc_audit.py --excel audit.xlsx --bcf audit.bcfzip
 
-	writes a real Excel workbook you can issue to the design team. No add-in
-	and no pip install - it is built with Python's own zip library. Every
-	sheet has a frozen header row and AutoFilter switched on.
+	writes both of the things a package review has to hand over.
+
+	The workbook is for the people who read - a real .xlsx you can issue to
+	the design team, no add-in and no pip install, built with Python's own
+	zip library. Every sheet has a frozen header row and AutoFilter switched
+	on.
+
+	The BCF is for the people who model: the same findings, under the same
+	rule ids, each one opening next to the element it is about. See "What
+	landed in Phase 3".
 
 	  Summary                Result block: FIX / REVIEW / PASS per check,
 	                         colour coded, with the package name and run date
@@ -642,6 +739,13 @@ Options (all optional - "python ifc_audit.py" alone still works)
 	--profile FILE.json    apply a submission profile - see v4
 	--rules                print the rule table and exit; no model needed
 	--excel audit.xlsx     write the shareable Excel workbook
+	--bcf audit.bcfzip     write a BCF 2.1 issue list, so every finding
+	                       opens next to the element that caused it in
+	                       Revit, Navisworks, Solibri or any other BCF
+	                       reader
+	--bcf-max 200          most topics to write to the BCF file, taken
+	                       worst first and a rule at a time so one noisy
+	                       rule cannot fill it. What did not fit is printed
 	--json report.json     also write every finding to a JSON file.  From
 	                       v4 the file is an object, not the bare list v3
 	                       wrote: {tool, generated, profile, rules,

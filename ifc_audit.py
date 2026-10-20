@@ -6,6 +6,11 @@ Every finding carries a stable rule id (F01, G05, X02 ...) so it can be cited
 in an email, a BEP or a comment back from the design team; --rules prints the
 table.
 
+--bcf FILE.bcfzip writes the same findings as a BCF 2.1 issue list, so each
+one opens next to the element that caused it in whatever the author already
+uses.  Topic GUIDs are derived from the finding rather than generated, so
+re-running the audit updates an existing issue list instead of duplicating it.
+
 What a given project, client or authority asks for is not built in - this tool
 is run on projects in several countries, and any one region's requirements
 baked in here would be wrong for all the others.  --profile FILE.json states
@@ -78,9 +83,10 @@ Usage:
   python ifc_audit.py <folder> --float-k 4               # stricter float check
   python ifc_audit.py <folder> --float-z 20              # absolute float limit, m
   python ifc_audit.py <folder> --profile project.json   # project expectations
+  python ifc_audit.py <folder> --bcf audit.bcfzip       # BCF 2.1 issue list
   python ifc_audit.py --rules                           # print the rule table
 """
-import re, sys, os, json, math, glob, argparse, datetime, time
+import re, sys, os, json, math, glob, argparse, datetime, time, uuid
 from collections import Counter, defaultdict
 
 # ----------------------------------------------------------------------------
@@ -854,6 +860,7 @@ class Model:
         self.decomposed = set()       # ids that aggregate/nest children
         self.n_containers = 0         # geometry-less aggregates, audited via children
         self.project_ids = []         # IfcProject ids, in file order
+        self.project_guid = None      # IfcProject GlobalId, for a BCF header
         self.site_ids = []            # IfcSite ids, in file order
         self.spatial = {}             # id -> spatial record (site/building/storey/space)
         self.building_ids = []
@@ -916,6 +923,8 @@ class Model:
                     a = split_args(rec[2])
                     self.n_projects += 1
                     self.project_ids.append(rec[0])
+                    if self.project_guid is None:
+                        self.project_guid = sval(arg(a, 0))
                     proj_units = ref(arg(a, 8))
                     ctx_ids += reflist(arg(a, 7))
                     self._count_guid(sval(arg(a, 0)), rec[0], typ)
@@ -1103,7 +1112,7 @@ class Model:
         storey elevation there and the site latitude on IfcSite, so reading it
         by position on anything else would record a latitude as a level.
         """
-        rec = {'id': eid, 'class': typ,
+        rec = {'id': eid, 'class': typ, 'guid': sval(arg(a, 0)),
                'name': sval(arg(a, 2)) or '',
                'long_name': sval(arg(a, 7)) or '',
                'composition': (enum_val(arg(a, 8))
@@ -1218,7 +1227,8 @@ class Model:
                 self.n_containers += 1
                 continue
             self.elements.append(
-                Element(eid, typ, name, otype, tag, place, shape, pdt, pdt_how))
+                Element(eid, typ, name, otype, tag, place, shape, pdt, pdt_how,
+                        sval(arg(a, 0))))
         # instance -> type object, for a family-name fallback
         for (t, a) in list(self.ent.values()):
             if t == 'IFCRELDEFINESBYTYPE':
@@ -1508,12 +1518,16 @@ class Model:
 
 
 class Element:
-    __slots__ = ('id', 'ifc_class', 'name', 'object_type', 'tag', 'place_id',
-                 'shape_id', 'bbox', 'source', 'predefined', 'pdt_source')
+    __slots__ = ('id', 'guid', 'ifc_class', 'name', 'object_type', 'tag',
+                 'place_id', 'shape_id', 'bbox', 'source', 'predefined',
+                 'pdt_source')
 
     def __init__(self, eid, cls, name, otype, tag, place_id, shape_id,
-                 predefined=None, pdt_source='index'):
+                 predefined=None, pdt_source='index', guid=None):
         self.id = eid
+        # the IFC GlobalId: what BCF addresses an element by, and the only id
+        # that survives a re-export.  The STEP line number does not.
+        self.guid = guid
         self.ifc_class = cls
         self.name = name
         self.object_type = otype
@@ -1838,18 +1852,24 @@ def audit_hierarchy(m):
     filled in.
     """
     problems = []
+
+    def note(text, rec=None):
+        problems.append({'text': text,
+                         'id': None if rec is None else rec['id'],
+                         'guid': None if rec is None else rec['guid'],
+                         'class': None if rec is None else rec['class']})
+
     if m.spatial and not m.agg_parent:
-        return {'ok': False, 'orphans': len(m.spatial),
-                'problems': ['no IfcRelAggregates in the file, so nothing '
-                             'states which site, building or storey anything '
-                             'belongs to']}
+        note('no IfcRelAggregates in the file, so nothing states which site, '
+             'building or storey anything belongs to')
+        return {'ok': False, 'orphans': len(m.spatial), 'problems': problems}
 
     for pid in m.project_ids:
         if pid in m.agg_parent:
             up = m.agg_parent[pid]
-            problems.append('IfcProject is aggregated into %s, so it is not '
-                            'the apex of the hierarchy'
-                            % ifc_name((m.spatial.get(up) or {}).get('class', '?')))
+            note('IfcProject is aggregated into %s, so it is not the apex of '
+                 'the hierarchy'
+                 % ifc_name((m.spatial.get(up) or {}).get('class', '?')))
 
     orphans = 0
     for rec in sorted(m.spatial.values(), key=lambda r: r['id']):
@@ -1858,16 +1878,15 @@ def audit_hierarchy(m):
         if pid is None:
             orphans += 1
             if len(problems) < 40:
-                problems.append('%s %s is not aggregated into anything'
-                                % (ifc_name(rec['class']), spatial_name(rec)))
+                note('%s %s is not aggregated into anything'
+                     % (ifc_name(rec['class']), spatial_name(rec)), rec)
             continue
         got = ('IFCPROJECT' if pid in m.project_ids
                else (m.spatial.get(pid) or {}).get('class', '?'))
         if got not in want and len(problems) < 40:
-            problems.append('%s %s hangs off %s, not %s'
-                            % (ifc_name(rec['class']), spatial_name(rec),
-                               ifc_name(got),
-                               ' or '.join(ifc_name(w) for w in want)))
+            note('%s %s hangs off %s, not %s'
+                 % (ifc_name(rec['class']), spatial_name(rec), ifc_name(got),
+                    ' or '.join(ifc_name(w) for w in want)), rec)
     return {'ok': not problems, 'problems': problems[:40], 'orphans': orphans}
 
 
@@ -1933,7 +1952,8 @@ def audit_spatial(m, elems, u):
     for sid in m.storey_ids:
         rec = m.spatial[sid]
         z = me(rec['z'])
-        storeys.append({'id': sid, 'name': spatial_name(rec),
+        storeys.append({'id': sid, 'guid': rec['guid'],
+                        'name': spatial_name(rec),
                         'long_name': rec['long_name'],
                         'elevation_m': me(rec['elevation']),
                         'z_m': z,
@@ -2422,6 +2442,35 @@ def audit_file(path, opt):
     # -- spatial structure --------------------------------------------------
     spatial = audit_spatial(m, elems, u)
 
+    # -- what a BCF topic needs and a finding does not carry ----------------
+    # BCF addresses an element by IfcGuid and places its camera from the
+    # element's extent.  The findings carry neither: a STEP id is local to one
+    # file and changes on the next export.  Only the elements some finding
+    # actually names are indexed - the whole model would be tens of thousands
+    # of rows carried through a report meant to be read.
+    bcf_idx = None
+    if getattr(opt, 'bcf', None):
+        want = set()
+        for g in dup_groups:
+            want.update(g['ids'])
+        for _g, _c, det in dup_guid_list:
+            want.update(d[0] for d in det)
+        for h in inter:
+            want.add(h['a'])
+            want.add(h['b'])
+        for fl in floating:
+            want.add(fl['id'])
+        for row in cls['rows']:
+            want.add(row['id'])
+        for x in spatial['loose'] + spatial['above_storey']:
+            want.add(x['id'])
+        bcf_idx = {}
+        for e in elems:
+            if e.id in want and e.guid:
+                bcf_idx[e.id] = ([e.guid] +
+                                 ([round(me(v), 3) for v in e.bbox]
+                                  if e.bbox else []))
+
     site = m.site[0] if m.site else (None, None, None, '')
     return {
         'file': m.name, 'schema': m.schema,
@@ -2450,6 +2499,10 @@ def audit_file(path, opt):
         'world_centre_ENH': world_centre, 'world_origin_ENH': world_origin,
         'world_envelope_ENH': world_env,
         'footprint_m': footprint,
+        'local_envelope_m': ([round(me(v), 3) for v in envelope]
+                             if envelope else None),
+        'project_guid': m.project_guid,
+        '_bcf_index': bcf_idx,
         'float_thresholds_m': float_thr,
         'n_elements': len(elems), 'n_with_body_geometry': n_body,
         'n_dup_skipped': n_dup_skipped,
@@ -2661,6 +2714,9 @@ def centre_spread(res):
 
 FIX, REVIEW, PASS = '!', '?', 'ok'
 
+# What the tool calls itself in everything it writes
+TOOL_NAME = 'ifc_audit v4'
+
 # ----------------------------------------------------------------------------
 # Rule registry
 #
@@ -2744,7 +2800,7 @@ PROFILE_OPTIONS = {
     'expect_schema', 'expect_view', 'clash', 'clash_frac', 'dup_tol', 'dup_iou',
     'probable_iou', 'geo_tol', 'min_geometry', 'min_classified', 'float_k',
     'float_detach', 'float_min', 'float_xy', 'float_z', 'max_rows',
-    'storey_tol', 'storey_datum',
+    'storey_tol', 'storey_datum', 'bcf_max',
 }
 
 COVER_WORDS = ('covered', 'partial')
@@ -2894,7 +2950,7 @@ def collect_findings(res, opt, lab):
             # the SPATIAL STRUCTURE section lists every one
             rest = ('' if len(h['problems']) < 2
                     else ' (and %d more in that model)' % (len(h['problems']) - 1))
-            bits.append('%s - %s%s' % (l, h['problems'][0], rest))
+            bits.append('%s - %s%s' % (l, h['problems'][0]['text'], rest))
         more = ('' if len(broken) <= 3
                 else '; and %s' % plural(len(broken) - 3, 'further model'))
         add(FIX, 'S01', 'the spatial hierarchy is not rooted in %s: %s%s - a '
@@ -3461,7 +3517,7 @@ def _spatial_section(res, opt, lab, lw):
         print('')
         print('  %s' % lab[r['file']])
         for p in probs[:opt.max_rows]:
-            print('    %s' % wrap(p, SECTION_W - 4, 4))
+            print('    %s' % wrap(p['text'], SECTION_W - 4, 4))
         if len(probs) > opt.max_rows:
             print('    ... and %s more'
                   % plural(len(probs) - opt.max_rows, 'problem'))
@@ -3883,6 +3939,739 @@ def _diag_section(res, opt, lab, lw):
 
 
 # ----------------------------------------------------------------------------
+# BCF 2.1 export
+#
+# What this changes is who can act on the report.  A finding in a text file has
+# to be found again by hand in the authoring tool; a finding in BCF opens next
+# to the element that caused it, in whatever the author already uses - Revit,
+# Navisworks, Solibri, BIMcollab, usBIM.
+#
+# BCF 2.1 is a zip: bcf.version at the root, then one folder per topic holding
+# markup.bcf (what the issue is), viewpoint.bcfv (where to look and what to
+# select) and snapshot.png (what it looks like).  The same zipfile machinery
+# the .xlsx writer uses, so the no-install promise survives.
+#
+# Two decisions worth knowing:
+#
+#   Topic GUIDs are derived, not random.  A topic's GUID is a UUID5 of the
+#   rule id, the model and the elements it is about, so re-running the audit
+#   after a fix produces the SAME GUID for the same finding.  A BCF tool can
+#   then see a topic it already has - closed, assigned, commented on - instead
+#   of a new one every week, which is what makes the export usable as an issue
+#   list rather than a weekly dump.
+#
+#   Components are addressed by IfcGuid.  The STEP line number is local to one
+#   file and changes on the next export; the GlobalId is what both the model
+#   and the receiving tool agree on.
+# ----------------------------------------------------------------------------
+
+# Fixed namespace: the GUIDs must not move between runs or between machines.
+BCF_NS = uuid.UUID('6f7b1f52-1a2d-5a1e-9f3c-1d4b7a9e2c80')
+
+# Standard BCF 2.1 vocabulary.  An extensions.xsd would let us invent our own
+# words, at the cost of tools that only accept the standard ones - and FIX /
+# REVIEW map onto High / Normal without inventing anything.
+BCF_PRIORITY = {FIX: 'High', REVIEW: 'Normal', PASS: 'Low'}
+BCF_STATUS = 'Open'
+BCF_AUTHOR = 'ifc_audit'
+SNAP_W, SNAP_H = 440, 330
+
+
+def bcf_guid(*parts):
+    """A stable topic GUID: the same finding gets the same one every run."""
+    return str(uuid.uuid5(BCF_NS, '|'.join('' if p is None else str(p)
+                                           for p in parts)))
+
+
+def _bx(t):
+    """XML text/attribute escape.  _xesc leaves quotes alone; attributes cannot."""
+    return _xesc(t).replace('"', '&quot;').replace("'", '&apos;')
+
+
+def _f6(v):
+    return '%.6f' % (v or 0.0)
+
+
+# -- the picture -------------------------------------------------------------
+
+def _png(w, h, buf):
+    """A PNG from a raw RGB buffer.  zlib and crc32 are both standard library."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return (struct.pack('>I', len(data)) + tag + data +
+                struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)                       # filter type 0: no filtering
+        raw += buf[y * w * 3:(y + 1) * w * 3]
+    return (b'\x89PNG\r\n\x1a\n'
+            + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(bytes(raw), 9))
+            + chunk(b'IEND', b''))
+
+
+def _rect(buf, w, h, x0, y0, x1, y1, rgb):
+    """Fill a rectangle, clipped to the canvas."""
+    x0, x1 = max(0, min(int(x0), int(x1))), min(w - 1, max(int(x0), int(x1)))
+    y0, y1 = max(0, min(int(y0), int(y1))), min(h - 1, max(int(y0), int(y1)))
+    if x1 < x0 or y1 < y0:
+        return
+    row = bytes(rgb) * (x1 - x0 + 1)
+    for y in range(y0, y1 + 1):
+        i = (y * w + x0) * 3
+        buf[i:i + len(row)] = row
+
+
+def _frame_rect(buf, w, h, x0, y0, x1, y1, rgb, t=1):
+    _rect(buf, w, h, x0, y0, x1, y0 + t - 1, rgb)
+    _rect(buf, w, h, x0, y1 - t + 1, x1, y1, rgb)
+    _rect(buf, w, h, x0, y0, x0 + t - 1, y1, rgb)
+    _rect(buf, w, h, x1 - t + 1, y0, x1, y1, rgb)
+
+
+def bcf_snapshot(plan, sev):
+    """A plan of the model with the topic's elements marked on it.
+
+    Not a render - this tool has no geometry kernel and does not want one.  It
+    is the one thing a BCF issue list needs that the XML cannot carry: enough
+    of a picture to tell, in the list, whether a finding is in the middle of
+    the building or out on its own.  A square box in the corner of the plan is
+    a stray element; eight boxes along a wall are a line of duplicates.
+    """
+    env = plan.get('env')
+    if not env:
+        return None
+    boxes = plan.get('boxes') or ()
+    outlines = plan.get('outlines') or ()
+    pad = 14
+    ex0, ey0, ex1, ey1 = env[0], env[1], env[3], env[4]
+    # the envelope already contains every element, strays included, so the
+    # plan never has to be stretched to fit a mark
+    sx = (SNAP_W - 2 * pad) / max(ex1 - ex0, 1e-6)
+    sy = (SNAP_H - 2 * pad) / max(ey1 - ey0, 1e-6)
+    sc = min(sx, sy)
+    ox = pad + ((SNAP_W - 2 * pad) - (ex1 - ex0) * sc) / 2.0
+    oy = pad + ((SNAP_H - 2 * pad) - (ey1 - ey0) * sc) / 2.0
+
+    def px(x, y):
+        # north up: image rows run the other way from model Y
+        return (ox + (x - ex0) * sc, SNAP_H - oy - (y - ey0) * sc)
+
+    buf = bytearray(b'\xf7\xf7\xf5' * (SNAP_W * SNAP_H))
+    a = px(ex0, ey0)
+    b = px(ex1, ey1)
+    _rect(buf, SNAP_W, SNAP_H, a[0], b[1], b[0], a[1], (0xe4, 0xe6, 0xe9))
+    _frame_rect(buf, SNAP_W, SNAP_H, a[0], b[1], b[0], a[1], (0xb4, 0xb8, 0xbe))
+
+    # one outline per model, for a package-wide topic: a model sitting away
+    # from the rest is the whole content of a survey-point finding
+    for o in outlines:
+        q0 = px(o[0], o[1])
+        q1 = px(o[3], o[4])
+        _frame_rect(buf, SNAP_W, SNAP_H, min(q0[0], q1[0]), min(q0[1], q1[1]),
+                    max(q0[0], q1[0]), max(q0[1], q1[1]), (0x6b, 0x72, 0x80))
+
+    mark = (0xc0, 0x39, 0x2b) if sev == FIX else (0xe0, 0x8e, 0x1b)
+    for bx in boxes:
+        p0 = px(bx[0], bx[1])
+        p1 = px(bx[3], bx[4])
+        # a hairline element still has to be visible at this scale
+        x0, x1 = min(p0[0], p1[0]), max(p0[0], p1[0])
+        y0, y1 = min(p0[1], p1[1]), max(p0[1], p1[1])
+        if x1 - x0 < 3:
+            x0, x1 = x0 - 1.5, x0 + 1.5
+        if y1 - y0 < 3:
+            y0, y1 = y0 - 1.5, y0 + 1.5
+        _rect(buf, SNAP_W, SNAP_H, x0, y0, x1, y1, mark)
+    _frame_rect(buf, SNAP_W, SNAP_H, 0, 0, SNAP_W - 1, SNAP_H - 1,
+                (0x8a, 0x8f, 0x96))
+    return _png(SNAP_W, SNAP_H, buf)
+
+
+# -- the viewpoint -----------------------------------------------------------
+
+def bcf_camera(box):
+    """An orthogonal camera looking down at a box from the south-west.
+
+    BCF coordinates are metres in the IFC file's own coordinate system, which
+    is why the extents indexed for this are project coordinates rather than
+    the survey datum the storey check compares levels in.
+    """
+    if not box or len(box) < 6:
+        return None
+    c = [(box[0] + box[3]) / 2.0, (box[1] + box[4]) / 2.0,
+         (box[2] + box[5]) / 2.0]
+    diag = math.sqrt(sum((box[i + 3] - box[i]) ** 2 for i in range(3)))
+    span = max(diag, 2.0)
+    d = _norm((0.55, 0.62, -0.56)) or (0.57, 0.57, -0.57)
+    # world up, projected onto the plane the camera looks through, so it is
+    # square to the view direction whatever direction that is
+    up = _norm(tuple((0., 0., 1.)[i] - d[i] * d[2] for i in range(3))) \
+        or (0., 1., 0.)
+    dist = span * 1.6
+    eye = [c[i] - d[i] * dist for i in range(3)]
+    return {'eye': eye, 'dir': d, 'up': up, 'scale': span * 1.3}
+
+
+def _bcfv(topic):
+    """viewpoint.bcfv - where to look, and what to select when you get there."""
+    cam = bcf_camera(topic.get('box'))
+    comps = ''.join(
+        '<Component IfcGuid="%s" OriginatingSystem="%s" AuthoringToolId="%s"/>'
+        % (_bx(g), _bx(TOOL_NAME), _bx('#%d' % i if i else ''))
+        for g, i in topic['components'][:COMP_CAP])
+    sel = '<Selection>%s</Selection>' % comps if comps else ''
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<VisualizationInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-'
+           'instance" Guid="%s">' % _bx(topic['viewpoint_guid'])]
+    if sel:
+        # everything stays visible: hiding the model would hide the context
+        # that tells the author whether the finding matters
+        out.append('<Components>%s<Visibility DefaultVisibility="true"/>'
+                   '</Components>' % sel)
+    if cam:
+        out.append(
+            '<OrthogonalCamera>'
+            '<CameraViewPoint><X>%s</X><Y>%s</Y><Z>%s</Z></CameraViewPoint>'
+            '<CameraDirection><X>%s</X><Y>%s</Y><Z>%s</Z></CameraDirection>'
+            '<CameraUpVector><X>%s</X><Y>%s</Y><Z>%s</Z></CameraUpVector>'
+            '<ViewToWorldScale>%s</ViewToWorldScale>'
+            '</OrthogonalCamera>'
+            % tuple([_f6(v) for v in cam['eye']] + [_f6(v) for v in cam['dir']]
+                    + [_f6(v) for v in cam['up']] + [_f6(cam['scale'])]))
+    out.append('</VisualizationInfo>')
+    return ''.join(out)
+
+
+def _markup(topic, stamp):
+    """markup.bcf - the issue itself.  Element order is the 2.1 sequence."""
+    # IfcProject is optional, and an empty one would claim a project GlobalId
+    # that the file does not carry
+    files = ''.join(
+        '<File%s isExternal="true"><Filename>%s</Filename>'
+        '<Date>%s</Date></File>'
+        % ((' IfcProject="%s"' % _bx(f['project_guid']))
+           if f.get('project_guid') else '',
+           _bx(f['name']), _bx(f.get('date') or stamp))
+        for f in topic['files'])
+    labels = ''.join('<Labels>%s</Labels>' % _bx(l) for l in topic['labels'])
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<Markup xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">']
+    if files:
+        out.append('<Header>%s</Header>' % files)
+    out.append(
+        '<Topic Guid="%s" TopicType="%s" TopicStatus="%s">'
+        '<Title>%s</Title><Priority>%s</Priority><Index>%d</Index>%s'
+        '<CreationDate>%s</CreationDate><CreationAuthor>%s</CreationAuthor>'
+        '<Description>%s</Description></Topic>'
+        % (_bx(topic['guid']), _bx(topic['type']), _bx(BCF_STATUS),
+           _bx(topic['title']), _bx(BCF_PRIORITY[topic['sev']]),
+           topic['index'], labels, _bx(stamp), _bx(BCF_AUTHOR),
+           _bx(topic['description'])))
+    out.append(
+        '<Comment Guid="%s"><Date>%s</Date><Author>%s</Author>'
+        '<Comment>%s</Comment><Viewpoint Guid="%s"/></Comment>'
+        % (_bx(bcf_guid('comment', topic['guid'])), _bx(stamp),
+           _bx(BCF_AUTHOR), _bx(topic['comment']),
+           _bx(topic['viewpoint_guid'])))
+    out.append('<Viewpoints Guid="%s"><Viewpoint>viewpoint.bcfv</Viewpoint>'
+               '%s</Viewpoints>'
+               % (_bx(topic['viewpoint_guid']),
+                  '<Snapshot>snapshot.png</Snapshot>' if topic['snapshot']
+                  else ''))
+    out.append('</Markup>')
+    return ''.join(out)
+
+
+def write_bcf(path, res, opt, lab):
+    """Write the issue list.  Returns what went in and what was left out."""
+    import zipfile
+
+    findings = collect_findings(res, opt, lab)
+    topics, dropped = bcf_topics(res, opt, lab, findings)
+    stamp = datetime.datetime.now().replace(microsecond=0).isoformat()
+    package = (os.path.commonprefix([r['file'] for r in res]).rstrip('-_ ')
+               or 'package')
+
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('bcf.version',
+                   '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<Version xmlns:xsi="http://www.w3.org/2001/XMLSchema-'
+                   'instance" VersionId="2.1">'
+                   '<DetailedVersion>2.1</DetailedVersion></Version>')
+        z.writestr('project.bcfp',
+                   '<?xml version="1.0" encoding="UTF-8"?>'
+                   '<ProjectExtension xmlns:xsi="http://www.w3.org/2001/'
+                   'XMLSchema-instance"><Project ProjectId="%s">'
+                   '<Name>%s</Name></Project></ProjectExtension>'
+                   % (_bx(bcf_guid('project', package)), _bx(package)))
+        for t in topics:
+            t['snapshot'] = bcf_snapshot(t['plan'], t['sev'])
+            z.writestr('%s/markup.bcf' % t['guid'], _markup(t, stamp))
+            z.writestr('%s/viewpoint.bcfv' % t['guid'], _bcfv(t))
+            if t['snapshot']:
+                z.writestr('%s/snapshot.png' % t['guid'], t['snapshot'])
+    return {'topics': len(topics), 'dropped': dropped,
+            'by_sev': Counter(t['sev'] for t in topics)}
+# ----------------------------------------------------------------------------
+# What becomes a topic
+#
+# One topic per thing somebody has to go and look at, which is not the same as
+# one topic per finding.  "213 elements left as a generic proxy" is one finding
+# and one topic per model - they are all fixed in the same export setting;
+# "11 duplicated elements" is one finding and eleven places to stand.  A rule
+# that names no elements - a schema mix, a survey point - stays one topic for
+# the package, because there is nowhere else to put the camera.
+#
+# Only FIX and REVIEW become topics.  A BCF file is a list of things to do,
+# and an issue list that arrives with twelve topics saying PASS is one nobody
+# opens twice.
+# ----------------------------------------------------------------------------
+
+def _box_of(idx, ids):
+    """Union extent of some elements, from the index, in metres."""
+    bb = None
+    for i in ids:
+        rec = idx.get(i)
+        if rec and len(rec) == 7:
+            bb = bb_union(bb, tuple(rec[1:]))
+    return list(bb) if bb else None
+
+
+def _boxes_of(idx, ids, cap=400):
+    """The individual extents, for the snapshot."""
+    out = []
+    for i in ids:
+        rec = idx.get(i)
+        if rec and len(rec) == 7:
+            out.append(rec[1:])
+            if len(out) >= cap:
+                break
+    return out
+
+
+COMP_CAP = 1000          # components in one viewpoint before it is trimmed
+
+
+def _comps(idx, ids, cap=COMP_CAP):
+    """(IfcGuid, STEP id) of the elements a receiving tool can select.
+
+    Returns (components, how many there were).  Some readers slow to a crawl
+    on a selection of ten thousand, so the list is capped - and the count is
+    returned with it, because a trimmed selection that does not say it was
+    trimmed reads as the whole finding.
+    """
+    out = []
+    seen = set()
+    total = 0
+    for i in ids:
+        rec = idx.get(i)
+        if rec and rec[0] not in seen:
+            seen.add(rec[0])
+            total += 1
+            if len(out) < cap:
+                out.append((rec[0], i))
+    return out, total
+
+
+def _file_ref(r):
+    return {'name': r['file'], 'project_guid': r.get('project_guid'),
+            'date': r.get('export_date')}
+
+
+def _package_view(res):
+    """The camera box and the plan for a topic about the package as a whole.
+
+    These are two different frames on purpose.
+
+    The plan is drawn in map coordinates, because that is the frame a
+    federated set actually lands in: a model exported on its survey point
+    carries its offset in IfcMapConversion and sits near the project origin
+    until that is applied, so a plan in project coordinates would show it 600
+    km from the rest and say nothing about where it really is.  In the map
+    frame the models lie on top of each other and the one that is genuinely
+    out of place is the one that shows.
+
+    The camera cannot follow it there: a viewpoint is read against one IFC
+    file's own coordinates, and a box spanning two frames would open the
+    model somewhere between them.  It takes the largest single model instead,
+    which is the view the package is read from anyway.
+    """
+    plan = None
+    outlines = []
+    for r in res:
+        e = r.get('world_envelope_ENH') or r.get('local_envelope_m')
+        if e:
+            outlines.append(e)
+            plan = bb_union(plan, tuple(e))
+    # the camera frames the models that share a frame with each other - the
+    # majority, found from the median centre, so one model exported on a
+    # different coordinate base cannot drag the view out into empty space
+    # between the two frames
+    local = [r['local_envelope_m'] for r in res if r.get('local_envelope_m')]
+    box = None
+    if local:
+        cen = [[(e[i] + e[i + 3]) / 2.0 for i in range(3)] for e in local]
+        mid = [median([c[k] for c in cen]) for k in range(3)]
+        diag = median([math.sqrt(sum((e[i + 3] - e[i]) ** 2 for i in range(3)))
+                       for e in local])
+        reach = max(300.0, 6 * diag)
+        for e, c in zip(local, cen):
+            if math.sqrt(sum((c[k] - mid[k]) ** 2 for k in range(3))) <= reach:
+                box = bb_union(box, tuple(e))
+        box = list(box) if box else list(local[0])
+    return box, {'env': list(plan) if plan else None, 'boxes': [],
+                 'outlines': outlines}
+
+
+def bcf_topics(res, opt, lab, findings):
+    """Build every topic, then fit them to the budget. Returns (kept, dropped)."""
+    idx = dict((r['file'], r.get('_bcf_index') or {}) for r in res)
+    # the worst thing each rule said about this package, carried into every
+    # topic that rule produced: the topic says where, the rule says why
+    said = {}
+    for f in findings:
+        said.setdefault(f['id'], f)
+
+    cands = []
+    missed = Counter()
+
+    def mk(rule, sev, title, desc, files, comps=(), box=None, plan=None,
+           ttype='Issue', key='', by_elements=False, comment=None,
+           elems=None):
+        rt = RULE[rule]
+        f = said.get(rule)
+        if elems is not None:
+            # (model result, element ids): everything a viewpoint needs about
+            # them follows from the index
+            r_, ids_ = elems
+            comps, total = _comps(idx[r_['file']], ids_)
+            box = _box_of(idx[r_['file']], ids_)
+            plan = plan_of(r_, ids_)
+            if total > len(comps):
+                desc += ('%sThe viewpoint selects the first %d of %d '
+                         'elements; the workbook lists them all.'
+                         % (chr(10) * 2, len(comps), total))
+        # A derived GUID, so the same finding keeps the same topic across runs
+        # and a BCF tool sees the issue it already has rather than a new one
+        # every week.  Group topics are identified by what they are about -
+        # one export setting, one model - and instance topics by the elements
+        # themselves, because a STEP id changes on the next export and a
+        # GlobalId does not.
+        ident = [rule, key]
+        if by_elements:
+            ident.append(','.join(sorted(g for g, _ in comps)))
+        guid = bcf_guid(*ident)
+        seen = []
+        for fr in files:                      # one File entry per model
+            if fr['name'] not in [x['name'] for x in seen]:
+                seen.append(fr)
+        cands.append({
+            'rule': rule, 'sev': sev, 'type': ttype, 'guid': guid,
+            'viewpoint_guid': bcf_guid('viewpoint', guid),
+            'title': '%s  %s' % (rule, title),
+            'description': desc,
+            'comment': comment or ('%s: %s' % (rt['title'], f['text']) if f
+                                   else rt['title']),
+            'labels': [rule, rt['area'], SEV_WORD[sev]],
+            'files': seen, 'components': comps, 'box': box,
+            'plan': plan or {}, 'snapshot': None, 'index': 0})
+
+    def plan_of(r, ids):
+        return {'env': r.get('local_envelope_m'),
+                'boxes': _boxes_of(idx[r['file']], ids)}
+
+    # -- per model, per element ---------------------------------------------
+    for r in res:
+        l = lab[r['file']]
+        fr = [_file_ref(r)]
+        sp = r['spatial']
+
+        # S01 - the spatial tree
+        if sp['hierarchy']['problems']:
+            comps = [(p['guid'], p['id']) for p in sp['hierarchy']['problems']
+                     if p.get('guid')]
+            mk('S01', FIX, '%s: spatial hierarchy not rooted' % l,
+               'The spatial tree of %s does not reach the IfcProject:\n%s\n'
+               'A receiving system walks IfcProject > IfcSite > IfcBuilding > '
+               'IfcBuildingStorey to decide what belongs to what, so anything '
+               'off that chain is invisible to it however complete the entity '
+               'itself looks.'
+               % (r['file'], '\n'.join('  - ' + p['text']
+                                       for p in sp['hierarchy']['problems'][:40])),
+               fr, comps, r.get('local_envelope_m'),
+               {'env': r.get('local_envelope_m'), 'boxes': []},
+               key='%s|tree' % r['file'])
+
+        # S04 - elements off the storeys
+        if sp['n_loose']:
+            ids = [x['id'] for x in sp['loose']]
+            mk('S04', FIX, '%s: %s in no spatial structure'
+               % (l, plural(sp['n_loose'], 'element')),
+               'These elements are in no IfcRelContainedInSpatialStructure, '
+               'directly or through a decomposition, so they sit on no '
+               'storey:\n%s\nThey show under no level in a receiving system '
+               'and are skipped by anything that walks the model by storey. '
+               'Assign each to the storey it belongs to.'
+               % '\n'.join('  - %s x%d' % (ifc_name(c), n)
+                           for c, n in sp['loose_by_class']),
+               fr, key='%s|loose' % r['file'], elems=(r, ids))
+        if sp['n_above_storey']:
+            ids = [x['id'] for x in sp['above_storey']]
+            mk('S04', REVIEW, '%s: %s held above storey level'
+               % (l, plural(sp['n_above_storey'], 'element')),
+               'These elements are held by the site, the building or another '
+               'container rather than by a storey:\n%s\nCorrect for external '
+               'works and for anything spanning the whole building; worth '
+               'confirming for the rest.'
+               % '\n'.join('  - %s: %s' % (w, plural(n, 'element'))
+                           for w, n in sp['above_by_container']),
+               fr, key='%s|above' % r['file'], elems=(r, ids))
+
+        # D01 - a GlobalId used twice
+        for guid, count, det in r['dup_guid_detail']:
+            ids = [d[0] for d in det]
+            mk('D01', FIX, '%s: GlobalId %s used %d times' % (l, guid, count),
+               'GlobalId %s is carried by %d entities in %s (%s).\nA GlobalId '
+               'must be unique within a file, so this one makes the file '
+               'schema-invalid - and anything addressing these elements by id, '
+               'this BCF included, cannot tell them apart.'
+               % (guid, count, r['file'],
+                  ', '.join('#%d %s' % (d[0], ifc_name(d[1])) for d in det)),
+               fr, key='%s|guid|%s' % (r['file'], guid), elems=(r, ids))
+
+        # D02 / D03 - duplicates, copied blocks collapsed as in the report
+        blocks, singles = block_runs(r['duplicates'])
+        for b in blocks:
+            ids = [i for g in b['groups'] for i in g['ids']]
+            dup = b['verdict'] == 'DUPLICATE'
+            mk('D02' if dup else 'D03', FIX if dup else REVIEW,
+               '%s: %s of %s copied as one block (%s)'
+               % (l, plural(len(b['groups']), 'pair'), ifc_name(b['class']),
+                  (b['type'] or '(no type name)')[:34]),
+               'Every pair here is offset by exactly +%d, which is one block '
+               'copied in a single action rather than %d separate mistakes.\n'
+               'Class %s, type %s.\nPairs: %s'
+               % (b['offset'], len(b['groups']), ifc_name(b['class']),
+                  b['type'] or '(no type name)',
+                  ', '.join('#%d+#%d' % (g['ids'][0], g['ids'][1])
+                            for g in b['groups'][:40])),
+               fr, key='%s|block|%s|%s|%s' % (r['file'], b['class'],
+                                             b['type'], b['offset']),
+               by_elements=True, elems=(r, ids))
+        for g in singles:
+            dup = g['verdict'] == 'DUPLICATE'
+            mk('D02' if dup else 'D03', FIX if dup else REVIEW,
+               '%s: %s %s x%d (%s)'
+               % (l, g['verdict'].lower(), ifc_name(g['class']), g['count'],
+                  (g['type'] or '(no type name)')[:34]),
+               '%d elements of class %s and type %s occupy the same place.\n'
+               '%s\nElements: %s%s'
+               % (g['count'], ifc_name(g['class']),
+                  g['type'] or '(no type name)', overlap_words(g['evidence']),
+                  ', '.join('#%d' % i for i in g['ids']),
+                  ('\nSource tags: ' + ', '.join(g['tags'])) if g['tags'] else ''),
+               fr, key='%s|dup|%s|%s' % (r['file'], g['class'], g['type']),
+               by_elements=True, elems=(r, g['ids']))
+
+        # X02 - floating.  audit_file keeps the 40 worst per model; the rest
+        # are counted as not offered rather than forgotten.
+        if r['n_floating'] > len(r['floating']):
+            missed['X02'] += r['n_floating'] - len(r['floating'])
+        for fl in r['floating']:
+            mk('X02', fl['grade'],
+               '%s: %s %g m from the model'
+               % (l, ifc_name(fl['class']), max(fl['plan_m'], fl['vert_m'])),
+               '#%d %s (%s) is %s.\n%s\nIn plan %g m and vertically %g m from '
+               'the model centre, and clear of everything else by %s m.'
+               % (fl['id'], ifc_name(fl['class']), fl['type'], fl['verdict'],
+                  fl['reason'], fl['plan_m'], fl['vert_m'], fl['clear_m']),
+               fr, key='%s|float' % r['file'], by_elements=True,
+               elems=(r, [fl['id']]))
+
+        # C01 / C02 - does the element say what it is
+        c = r['classification']
+        if c['n_proxy']:
+            ids = [w['id'] for w in c['rows'] if w['class'] in PROXY_CLASSES]
+            mk('C01', FIX, '%s: %s left as a generic proxy'
+               % (l, plural(c['n_proxy'], 'element')),
+               'The exporter could not map these families to an IFC class, so '
+               'they arrive as a proxy and nothing downstream knows what they '
+               'are. Map the family to a real IFC class in the export setup, '
+               'or correct the family category in the authoring model.',
+               fr, key='%s|proxy' % r['file'], elems=(r, ids))
+        bad = [w for w in c['rows']
+               if w['grade'] != PASS and w['class'] not in PROXY_CLASSES]
+        if bad and c['n'] and c['n_classified'] < c['n'] * opt.min_classified:
+            ids = [w['id'] for w in bad]
+            worst = Counter('%s %s' % (ifc_name(w['class']),
+                                       w['predefined'] or '(absent)')
+                            for w in bad)
+            mk('C02', REVIEW, '%s: PredefinedType missing or unspecific on %s'
+               % (l, plural(len(bad), 'element')),
+               '%d of %d elements (%.0f%%) carry a specific PredefinedType. '
+               'The rest say nothing, say USERDEFINED with nothing to read it '
+               'by, or sit on a generic supertype:\n%s'
+               % (c['n_classified'], c['n'],
+                  100.0 * c['n_classified'] / c['n'],
+                  '\n'.join('  - %s x%d' % (k, v)
+                            for k, v in worst.most_common(12))),
+               fr, key='%s|pdt' % r['file'], elems=(r, ids))
+
+        # X01 - how much of the model could be read at all
+        if r['n_elements'] and (r['n_with_body_geometry']
+                                < r['n_elements'] * opt.min_geometry):
+            mk('X01', FIX, '%s: geometry unresolved for %.0f%% of the model'
+               % (l, 100.0 - 100.0 * r['n_with_body_geometry'] / r['n_elements']),
+               '%d of %d elements resolved from real geometry. The rest were '
+               'read from their placement origin alone, which is a point '
+               'rather than an extent - those elements are left out of the '
+               'duplicate check and can read as floating.%s'
+               % (r['n_with_body_geometry'], r['n_elements'],
+                  ('\nUnresolved representations: '
+                   + ', '.join('%s x%d' % (ifc_name(k), v) for k, v
+                               in r['unhandled_geometry'].items()))
+                  if r['unhandled_geometry'] else ''),
+               fr, [], r.get('local_envelope_m'),
+               {'env': r.get('local_envelope_m'), 'boxes': []},
+               key='%s|geom' % r['file'])
+
+        # X03 - interferences, grouped by class pair as the report groups them
+        if opt.clash and r['n_interferences']:
+            pairs = defaultdict(list)
+            for h in r['interferences']:
+                pairs[tuple(sorted((h['a_class'], h['b_class'])))].append(h)
+            for k, hs in sorted(pairs.items(), key=lambda kv: -len(kv[1])):
+                ids = []
+                for h in hs:
+                    ids += [h['a'], h['b']]
+                mk('X03', REVIEW, '%s: %s overlapping, %s'
+                   % (l, plural(len(hs), 'pair'),
+                      '%s / %s' % (ifc_name(k[0]), ifc_name(k[1]))),
+                   '%s of %s and %s overlap by %d%% or more of the smaller '
+                   'element; the worst is #%d against #%d at %.0f%%.\n'
+                   'This is a bounding-box test, not a solid intersection: on '
+                   'MEP it reports pipes overlapping their own fittings at '
+                   'connections. Read it as a smell test rather than as clash '
+                   'detection.'
+                   % (plural(len(hs), 'pair'), ifc_name(k[0]), ifc_name(k[1]),
+                      round(opt.clash_frac * 100), hs[0]['a'], hs[0]['b'],
+                      hs[0]['overlap_frac'] * 100),
+                   fr, ttype='Clash', elems=(r, ids),
+                   key='%s|clash|%s|%s' % (r['file'], k[0], k[1]))
+
+    # -- S03, which is about the package rather than any one model ----------
+    pkg_env, pkg_plan = _package_view(res)
+    by_label = dict((lab[r['file']], r) for r in res)
+    groups = level_groups(res, lab, opt.storey_tol / 1000.0)
+    split, drift = storey_conflicts(groups, opt.storey_datum / 1000.0,
+                                    opt.storey_tol / 1000.0,
+                                    _anchor_offsets(res, lab))
+
+    def storey_comps(rows):
+        return [(s['guid'], s['id']) for _l, s in rows if s.get('guid')]
+
+    if len([1 for r in res if r['spatial']['n_storeys']]) > 1:
+        for d in drift:
+            rows = [(l, s) for g in groups for nm in g['names']
+                    if nm['key'] == norm_storey(d['name'])
+                    for l, s in nm['rows']]
+            if d['anchor']:
+                sev = REVIEW
+                why = ('The models hang at different survey heights by this '
+                       'same amount, so the storeys themselves agree. Fix the '
+                       'survey point - rule G05 - and these follow.')
+            elif d['datum']:
+                sev = REVIEW
+                why = ('A datum difference of %.0f mm. A structural model '
+                       'carrying top of concrete against an architectural one '
+                       'carrying finished floor level reads exactly like this, '
+                       'so confirm the datum rather than moving anything.'
+                       % (d['spread_m'] * 1000.0))
+            else:
+                sev = FIX
+                why = ('One of these models stacks wrong, and nothing in '
+                       'either of them looks wrong on its own. Agree which '
+                       'level the name refers to and re-export the model that '
+                       'is out.')
+            mk('S03', sev, 'level "%s" is at %d different heights'
+               % (d['name'], len(d['at'])),
+               '%s\n%s' % (drift_words(d), why),
+               [_file_ref(by_label[l]) for l, _ in rows],
+               storey_comps(rows), pkg_env, pkg_plan,
+               key='drift|%s' % norm_storey(d['name']))
+        for g in split:
+            rows = [(l, s) for nm in g['names'] for l, s in nm['rows']]
+            mk('S03', REVIEW, 'one level at %+.3f m carries %d names'
+               % (g['z'], len(g['names'])),
+               '%s\nAnything that groups the package by storey - a federated '
+               'viewer, a 4D sequence, a BCF issue list - sees %d levels where '
+               'there is one. Agree one name per level.'
+               % (level_words(g), len(g['names'])),
+               [_file_ref(by_label[l]) for l, _ in rows],
+               storey_comps(rows), pkg_env, pkg_plan,
+               key='split|%.3f' % g['z'])
+
+    # -- every rule that named no elements: one topic for the package -------
+    covered = set(c['rule'] for c in cands)
+    models = ', '.join('%s (%s)' % (lab[r['file']], r['file']) for r in res)
+    for f in findings:
+        if f['sev'] == PASS or f['id'] in covered:
+            continue
+        # the prose states the finding and then explains it after a dash.  The
+        # statement is the title a reader scans the issue list by; the whole of
+        # it, reasoning included, is the description.
+        short = f['text'].split(' - ')[0]
+        if not 20 <= len(short) <= 80:
+            short = (f['text'] if len(f['text']) <= 80
+                     else f['text'][:80].rsplit(' ', 1)[0].rstrip(' ,;-') + '...')
+        mk(f['id'], f['sev'], short, f['text'],
+           [_file_ref(r) for r in res], [], pkg_env, pkg_plan,
+           key='package|%s' % f['text'][:80],
+           comment='Audited across %s: %s'
+                   % (plural(len(res), 'model'), models))
+
+    return _fit(cands, opt.bcf_max, missed)
+
+
+def _fit(cands, budget, missed):
+    """Fit the topics to the budget: worst first, then a rule at a time.
+
+    Taken round-robin across the rules rather than straight off the top,
+    because one noisy rule would otherwise fill the file on its own - a
+    thousand interference pairs would bury eleven duplicated elements, and the
+    duplicates are the ones somebody has to act on.  What did not fit is
+    counted and printed rather than quietly left behind.
+    """
+    kept = []
+    dropped = Counter(missed)
+    for sev in (FIX, REVIEW):
+        by_rule = defaultdict(list)
+        for c in cands:
+            if c['sev'] == sev:
+                by_rule[c['rule']].append(c)
+        order = sorted(by_rule)
+        full = False
+        while not full and any(by_rule[k] for k in order):
+            for rule in order:
+                if not by_rule[rule]:
+                    continue
+                if len(kept) >= budget:
+                    full = True
+                    break
+                kept.append(by_rule[rule].pop(0))
+        for rule in order:
+            if by_rule[rule]:
+                dropped[rule] += len(by_rule[rule])
+    for i, t in enumerate(kept, start=1):
+        t['index'] = i
+    return kept, Counter(dict((k, v) for k, v in dropped.items() if v))
+
+
+# ----------------------------------------------------------------------------
 # Minimal .xlsx writer
 #
 # Written straight to the OOXML package with zipfile so the tool keeps its
@@ -4246,7 +5035,7 @@ def excel_report(path, res, opt):
     for r in res:
         for p in r['spatial']['hierarchy']['problems']:
             ss.append([lab[r['file']], '(hierarchy)', '', None, None, None,
-                       None, (SEV_WORD[FIX], S_FIX), (p, S_WRAP), '',
+                       None, (SEV_WORD[FIX], S_FIX), (p['text'], S_WRAP), '',
                        None, None, ''])
     if len(ss) > 1:
         sheets.append(('Spatial structure', ss, 1))
@@ -4345,6 +5134,14 @@ def main():
     ap.add_argument('--json', help='also write the raw findings to this file')
     ap.add_argument('--excel', metavar='FILE.xlsx',
                     help='also write a shareable Excel workbook (no add-ins needed)')
+    ap.add_argument('--bcf', metavar='FILE.bcfzip',
+                    help='also write a BCF 2.1 issue list, so each finding '
+                         'opens next to the element that caused it in Revit, '
+                         'Navisworks, Solibri or any other BCF reader')
+    ap.add_argument('--bcf-max', type=int, default=200, metavar='N',
+                    help='most topics to write to the BCF file, taken worst '
+                         'first and a rule at a time so one noisy rule cannot '
+                         'fill it (default 200)')
     ap.add_argument('--float-xy', type=float, default=None, metavar='M',
                     help='absolute plan float threshold in metres from the model '
                          'centre (default: derived from the model)')
@@ -4456,7 +5253,7 @@ def main():
     if opt.json:
         # v4 wraps what v3 dumped as a bare list.  The findings carry the rule
         # ids, and a list has nowhere to put them.
-        doc = {'tool': 'ifc_audit v4',
+        doc = {'tool': TOOL_NAME,
                'generated': datetime.datetime.now().isoformat(timespec='seconds'),
                # which requirement revision this was run against, not just
                # the path it was read from - a report that cannot say that is
@@ -4468,10 +5265,38 @@ def main():
                            'checks': opt.profile_data.get('checks')},
                'rules': [RULE[r[0]] for r in RULES],
                'findings': collect_findings(res, opt, model_labels(res)),
-               'models': res}
+               # keys opening with '_' are what a writer needed, not findings
+               'models': [dict((k, v) for k, v in r.items()
+                               if not k.startswith('_')) for r in res]}
         with open(opt.json, 'w', encoding='utf-8') as fh:
             json.dump(doc, fh, indent=1, default=str)
         print('Raw JSON -> %s' % opt.json)
+
+    if opt.bcf:
+        name = (opt.bcf if opt.bcf.lower().endswith(('.bcfzip', '.bcf'))
+                else opt.bcf + '.bcfzip')
+        try:
+            out = write_bcf(name, res, opt, model_labels(res))
+        except OSError as e:
+            print('Could not write %s: %s' % (name, e))
+        else:
+            bits = ['%d %s' % (out['by_sev'][sv], SEV_WORD[sv])
+                    for sv in (FIX, REVIEW) if out['by_sev'][sv]]
+            print('BCF 2.1 -> %s   (%s%s)'
+                  % (name, plural(out['topics'], 'topic'),
+                     (': ' + ', '.join(bits)) if bits else ''))
+            if not out['topics'] and not out['dropped']:
+                # an empty issue list is a result, not a failure to write one
+                print('  nothing graded %s or %s, so there is nothing to '
+                      'raise.' % (SEV_WORD[FIX], SEV_WORD[REVIEW]))
+            if out['dropped']:
+                # a topic that did not fit is not a finding that went away
+                print('  %s beyond --bcf-max %d not written: %s'
+                      % (plural(sum(out['dropped'].values()), 'topic'),
+                         opt.bcf_max,
+                         ', '.join('%s x%d' % (k, v) for k, v
+                                   in sorted(out['dropped'].items()))))
+                print('  the report and the workbook carry all of them.')
 
     if opt.excel:
         name = opt.excel if opt.excel.lower().endswith('.xlsx') else opt.excel + '.xlsx'

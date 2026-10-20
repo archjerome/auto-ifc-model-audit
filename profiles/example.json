@@ -11,7 +11,8 @@
     "min_classified": 0.90,
     "geo_tol": 1.0,
     "storey_tol": 50.0,
-    "storey_datum": 600.0
+    "storey_datum": 600.0,
+    "bcf_max": 200
   },
 
   "severity_words": {

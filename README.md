@@ -6,6 +6,12 @@ Pure Python 3 standard library: no pip install, no IFC toolkit, no add-in.
 Every finding carries a stable rule id, so it can be cited in an email, a BEP,
 or a comment back from the design team. `--rules` prints the table.
 
+`--bcf` writes the same findings as a BCF 2.1 issue list, so each one opens
+next to the element that caused it in Revit, Navisworks, Solibri or any other
+BCF reader - with the explanation attached as a comment, and a topic GUID
+derived from the finding so re-running the audit updates the issue list
+instead of duplicating it.
+
 What a given project, client or authority asks for is not built in - the tool
 runs on projects in several countries, and any one region's requirements baked
 into the source would be wrong for all the others. Those live in a profile
@@ -55,6 +61,7 @@ Usage
   python ifc_audit.py <folder-with-ifc-files>            # audit a package
   python ifc_audit.py model1.ifc model2.ifc ...          # audit specific files
   python ifc_audit.py <folder> --excel audit.xlsx        # shareable workbook
+  python ifc_audit.py <folder> --bcf audit.bcfzip        # BCF 2.1 issue list
   python ifc_audit.py <folder> --json report.json        # machine-readable
   python ifc_audit.py <folder> --clash                   # interference report
   python ifc_audit.py <folder> --profile project.json    # project expectations
@@ -85,6 +92,19 @@ Submission profiles
   This tool is a pre-check. Where a project is checked by someone else, their
   result is the one that counts; this finds the problems while they are still
   cheap to fix.
+
+Handing the results over
+  `--excel` is for the people who read and `--bcf` is for the people who model:
+  the same findings under the same rule ids, one as a workbook with a sheet per
+  area, the other as topics that open next to the element.
+
+  A BCF topic carries the elements by IfcGuid, an orthogonal camera framed on
+  them, a plan of the model with them marked on it, the instance detail as the
+  description and the rule's own statement as the first comment. Only FIX and
+  REVIEW become topics. `--bcf-max` caps how many are written, taken worst
+  first and then a rule at a time so one noisy rule cannot fill the file; what
+  did not fit is counted and printed, because a topic that did not fit is not a
+  finding that went away.
 
 See Instructions.txt for setup, the full option list, and how each verdict is
 reached.
